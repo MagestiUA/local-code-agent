@@ -60,8 +60,9 @@ def index() -> None:
             mine = m["role"] == "user"
             with ui.row().classes("w-full " + ("justify-end" if mine else "justify-start")):
                 ui.label(m["content"]).classes(
-                    "q-pa-sm rounded-borders " + ("bg-grey-3 dark:bg-grey-8" if mine else "")
-                ).style("max-width:80%; white-space:pre-wrap")
+                    "q-pa-md rounded-borders text-body1 "
+                    + ("bg-grey-8 text-white" if mine else "bg-grey-9 text-grey-2")
+                ).style("max-width:90%; white-space:pre-wrap; line-height:1.55")
 
     # ── Низові контролі (дрібні, другорядні) ─────────────────────────────────
     @ui.refreshable
@@ -133,7 +134,7 @@ def index() -> None:
             scan = ui.checkbox("Init scan — оглянути репо й створити чернетку AGENT.md")
             with ui.row():
                 ui.button("Скасувати", on_click=dlg.close).props("flat")
-                def create() -> None:
+                async def create() -> None:
                     root = folder.value.strip()
                     if not root:
                         ui.notify("Вкажіть папку проекту", type="warning"); return
@@ -146,6 +147,12 @@ def index() -> None:
                     cur["s"] = s
                     sidebar.refresh(); chat_view.refresh(); controls.refresh()
                     dlg.close()
+                    if s.init_scan:
+                        log("Оглядаю репозиторій, створюю чернетку AGENT.md…")
+                        client = await run.io_bound(get_client)
+                        doc = await run.io_bound(ensure_project_doc, s.project_root, client, True)
+                        log(f"AGENT.md створено ({len(doc)} символів)." if doc
+                            else "Не вдалося створити AGENT.md.")
                 ui.button("Створити чат", on_click=create)
         dlg.open()
 
@@ -250,14 +257,16 @@ def index() -> None:
         ui.label("Чати").classes("text-xs text-grey q-mt-sm")
         sidebar()
 
-    with ui.column().classes("w-full q-pa-md gap-3"):
-        chat_view()
-        work_area = ui.column().classes("w-full")
+    with ui.column().classes("w-full items-center q-pa-md"):
+        with ui.column().classes("gap-3").style("width:100%; max-width:880px"):
+            chat_view()
+            work_area = ui.column().classes("w-full")
 
     with ui.footer().classes("column gap-2 q-pa-sm bg-grey-10") \
             .style("border-top:1px solid rgba(255,255,255,0.08)"):
         with ui.row().classes("w-full items-center gap-2"):
-            task = ui.input(placeholder="Опишіть задачу...").props("outlined dense").classes("flex-grow") \
+            task = ui.input(placeholder="Опишіть задачу...") \
+                .props("outlined dense input-class=text-white").classes("flex-grow") \
                 .on("keydown.enter", send)
             ui.button(icon="send", on_click=send).props("round flat").classes("text-grey-4")
         controls()
