@@ -8,11 +8,18 @@
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
-from nicegui import ui
+from nicegui import run, ui
 
 from . import session as sess
+from .executor import apply_edit, run_edit
+from .llm import OllamaClient
+from .memory import render_for_planner
+from .planner import make_plan
+from .project import ensure_project_doc
+from .tools import read_file, run_shell
 
 PERM_EDITS = ["ask", "auto"]
 PERM_SHELL = ["allowlist", "ask", "off"]
@@ -137,15 +144,91 @@ def index() -> None:
                 ui.button("Створити чат", on_click=create)
         dlg.open()
 
-    def send() -> None:
+    def get_client() -> OllamaClient:
+        if not cur.get("client"):
+            cur["client"] = OllamaClient()
+        return cur["client"]
+
+    def build_context(s) -> str:
+        """AGENT.md (+ авто-чернетка за init_scan) і вміст read-only джерел."""
+        parts = []
+        doc = ensure_project_doc(
+            s.project_root,
+            client=get_client() if s.init_scan else None,
+            init_scan=s.init_scan,
+        )
+        if doc:
+            parts.append(f"AGENT.md:\n{doc}")
+        for rf in s.reference_files:
+            try:
+                parts.append(f"Reference {Path(rf).name} (read-only):\n{read_file(rf)[:4000]}")
+            except Exception:
+                pass
+        return "\n\n".join(parts)
+
+    async def ask_approval(diff: str) -> bool:
+        work_area.clear()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        with work_area:
+            ui.label("Запропоновані зміни").classes("text-sm")
+            ui.code(diff or "(порожній diff)").classes("w-full")
+            with ui.row():
+                ui.button("Прийняти", on_click=lambda: fut.set_result(True)).props("color=positive")
+                ui.button("Відхилити", on_click=lambda: fut.set_result(False)).props("color=negative")
+        result = await fut
+        work_area.clear()
+        return result
+
+    def log(content: str, kind: str = "note") -> None:
+        cur["s"].add_message("assistant", content, kind=kind)
+        sess.save_session(cur["s"])
+        chat_view.refresh()
+
+    async def run_task(text: str) -> None:
         s = cur["s"]
-        if not s or not task.value.strip():
-            return
-        s.add_message("user", task.value.strip())
-        s.add_message("assistant", "(агент буде підключено в M6c)", kind="note")
+        s.add_message("user", text)
         sess.save_session(s)
         task.value = ""
         chat_view.refresh()
+
+        client = await run.io_bound(get_client)
+        context = await run.io_bound(build_context, s)
+
+        log("Планую…")
+        state = await run.io_bound(make_plan, text, "", client, context)
+        log(render_for_planner(state), kind="plan")
+
+        for step in state.steps:
+            if step.kind == "inline":
+                continue
+            if step.kind == "deterministic":
+                d = step.description.lower()
+                if ("test" in d or "тест" in d) and s.permissions.get("shell") != "off":
+                    r = await run.io_bound(run_shell, "pytest -q")
+                    log(f"Тести: rc={r.returncode}\n{(r.stdout or r.stderr)[:800]}")
+                else:
+                    log(f"Детермінований крок (вручну): {step.description}")
+                continue
+            # llm
+            if not step.target:
+                log(f"Пропущено (немає файлу): {step.description}"); continue
+            target = Path(s.project_root) / step.target
+            if not target.exists():
+                log(f"Файл не знайдено: {step.target}"); continue
+            res = await run.io_bound(run_edit, target, step.description, client, False, context)
+            if not res.ok:
+                log(f"Помилка кроку #{step.id}: {res.error}"); continue
+            approve = True if s.permissions.get("edits") == "auto" else await ask_approval(res.diff)
+            if approve:
+                await run.io_bound(apply_edit, target, res)
+                log(f"Застосовано до {step.target}:\n{res.diff}", kind="diff")
+            else:
+                log(f"Відхилено: {step.target}")
+        log("Готово.")
+
+    async def send() -> None:
+        if cur.get("s") and task.value.strip():
+            await run_task(task.value.strip())
 
     # ── Розкладка ────────────────────────────────────────────────────────────
     with ui.header().classes("items-center justify-between"):
@@ -163,6 +246,7 @@ def index() -> None:
 
     with ui.column().classes("w-full q-pa-md gap-3"):
         chat_view()
+        work_area = ui.column().classes("w-full")
 
     with ui.footer().classes("column gap-2 q-pa-sm"):
         with ui.row().classes("w-full items-center gap-2"):
