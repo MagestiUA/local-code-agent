@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+*.log
+# робочі/тимчасові артефакти
+_*.txt
+scratch/
