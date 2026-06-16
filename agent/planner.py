@@ -52,9 +52,13 @@ SCHEMA = {
 }
 
 
-def make_plan(task: str, context: str = "", client: OllamaClient | None = None) -> TaskState:
+def make_plan(task: str, context: str = "", client: OllamaClient | None = None,
+              project_doc: str | None = None) -> TaskState:
     client = client or OllamaClient()
-    user = f"Задача:\n{task}"
+    user = ""
+    if project_doc:
+        user += f"Контекст проекту (AGENT.md):\n{project_doc}\n\n"
+    user += f"Задача:\n{task}"
     if context:
         user += f"\n\nКонтекст:\n{context}"
     msg = client.chat(

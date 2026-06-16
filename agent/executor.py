@@ -43,15 +43,18 @@ def _extract_code(text: str) -> str:
 
 
 def run_edit(path: str | Path, instruction: str,
-             client: OllamaClient | None = None, write: bool = False) -> EditResult:
+             client: OllamaClient | None = None, write: bool = False,
+             project_doc: str | None = None) -> EditResult:
     client = client or OllamaClient()
     original = tools.read_file(path)
 
     stripped, mapping = strip_code(original)
+    preamble = f"Project context:\n{project_doc}\n\n" if project_doc else ""
     messages = [
         {"role": "system", "content": SYSTEM},
         {"role": "user",
-         "content": f"Instruction:\n{instruction}\n\nFile `{path}`:\n```python\n{stripped}\n```"},
+         "content": f"{preamble}Instruction:\n{instruction}\n\n"
+                    f"File `{path}`:\n```python\n{stripped}\n```"},
     ]
     msg = client.chat(messages, profile=config.EXECUTOR)
     new_stripped = _extract_code(msg.get("content") or "")
