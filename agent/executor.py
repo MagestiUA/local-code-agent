@@ -73,3 +73,13 @@ def run_edit(path: str | Path, instruction: str,
         tools.write_file(path, final)
 
     return EditResult(True, final, diff, "", backup)
+
+
+def apply_edit(path: str | Path, result: EditResult) -> str | None:
+    """Записати СХВАЛЕНУ правку з бекапом. Викликати після показу diff і згоди
+    користувача (CLI/GUI). Повертає шлях бекапу."""
+    if not result.ok or result.final_code is None:
+        raise ValueError("немає валідного результату для запису")
+    backup = tools.backup_file(path)
+    tools.write_file(path, result.final_code)
+    return backup

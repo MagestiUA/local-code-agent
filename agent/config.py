@@ -14,6 +14,15 @@ MODEL = "gemma4:26b-a4b-it-qat"
 
 REQUEST_TIMEOUT = 600
 
+# run_shell allow-list: дозволені префікси команд (точний токен або "<prefix> ...").
+# Усе інше блокується БЕЗ виконання. Виконуємо через shell=False (без ланцюжків).
+ALLOWED_SHELL = (
+    "python", "py", "pip list", "pip show",
+    "pytest", "ruff", "flake8", "mypy",
+    "git status", "git diff", "git log",
+)
+SHELL_TIMEOUT = 120
+
 # Профілі ролей: (think, num_ctx, temperature)
 EXECUTOR = {"think": False, "num_ctx": 65536, "temperature": 0.2}
 PLANNER  = {"think": True,  "num_ctx": 65536, "temperature": 0.3}
