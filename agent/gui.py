@@ -28,6 +28,11 @@ PERM_SHELL = ["allowlist", "ask", "off"]
 @ui.page("/")
 def index() -> None:
     dark = ui.dark_mode(value=True)
+    ui.colors(
+        primary="#6b7280", secondary="#4b5563", accent="#7c83d3",
+        positive="#3f9168", negative="#b0504d",
+        dark="#1b1c1f", dark_page="#141517",
+    )
     cur: dict = {"s": None}   # поточна сесія
 
     # ── Сайдбар: список чатів ────────────────────────────────────────────────
@@ -231,16 +236,17 @@ def index() -> None:
             await run_task(task.value.strip())
 
     # ── Розкладка ────────────────────────────────────────────────────────────
-    with ui.header().classes("items-center justify-between"):
+    with ui.header().classes("items-center justify-between bg-grey-10 text-grey-4") \
+            .style("border-bottom:1px solid rgba(255,255,255,0.08)"):
         ui.label("local-code-agent").classes("text-subtitle1")
-        with ui.button(icon="settings").props("flat round"):
+        with ui.button(icon="settings").props("flat round").classes("text-grey-4"):
             with ui.menu():
                 ui.menu_item("Світла тема", lambda: dark.set_value(False))
                 ui.menu_item("Темна тема", lambda: dark.set_value(True))
                 ui.menu_item("Як у системі", lambda: dark.set_value(None))
 
-    with ui.left_drawer(value=True).props("width=240").classes("gap-2"):
-        ui.button("Новий чат", icon="add", on_click=new_chat_dialog).classes("w-full")
+    with ui.left_drawer(value=True).props("width=240 bordered").classes("gap-2 bg-grey-10"):
+        ui.button("Новий чат", icon="add", on_click=new_chat_dialog).props("outline").classes("w-full")
         ui.label("Чати").classes("text-xs text-grey q-mt-sm")
         sidebar()
 
@@ -248,11 +254,12 @@ def index() -> None:
         chat_view()
         work_area = ui.column().classes("w-full")
 
-    with ui.footer().classes("column gap-2 q-pa-sm"):
+    with ui.footer().classes("column gap-2 q-pa-sm bg-grey-10") \
+            .style("border-top:1px solid rgba(255,255,255,0.08)"):
         with ui.row().classes("w-full items-center gap-2"):
-            task = ui.input(placeholder="Опишіть задачу...").classes("flex-grow") \
+            task = ui.input(placeholder="Опишіть задачу...").props("outlined dense").classes("flex-grow") \
                 .on("keydown.enter", send)
-            ui.button(icon="send", on_click=send).props("round")
+            ui.button(icon="send", on_click=send).props("round flat").classes("text-grey-4")
         controls()
 
 
