@@ -50,9 +50,10 @@ class OllamaClient:
 
     # ── Запит ───────────────────────────────────────────────────────────────
     def chat(self, messages: list[dict], tools: list | None = None,
-             profile: dict = config.EXECUTOR) -> dict:
+             profile: dict = config.EXECUTOR, fmt: str | dict | None = None) -> dict:
         """Один виклик /api/chat. Повертає message (dict) з полями
-        content / thinking / tool_calls (за наявності)."""
+        content / thinking / tool_calls (за наявності).
+        fmt="json" або JSON-schema -> примусово валідний JSON у content."""
         payload = {
             "model": self.model,
             "messages": messages,
@@ -65,6 +66,8 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
+        if fmt:
+            payload["format"] = fmt
         r = requests.post(f"{self.host}/api/chat", json=payload,
                           timeout=config.REQUEST_TIMEOUT)
         r.raise_for_status()
