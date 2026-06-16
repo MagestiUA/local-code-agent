@@ -13,6 +13,8 @@ def main() -> None:
                     permissions={"edits": "ask", "shell": "off"}, init_scan=True)
     s.add_message("user", "відрефактори parser.py")
     s.add_message("assistant", "склав план з 4 кроків", kind="plan")
+    s.add_reference(r"F:\other\src.py")
+    s.add_reference(r"F:\other\src.py")   # дублікат не додається
     save_session(s, base=base)
 
     s2 = load_session(s.id, base=base)
@@ -22,6 +24,9 @@ def main() -> None:
     assert s2.init_scan is True
     assert len(s2.messages) == 2
     assert s2.messages[0]["content"] == "відрефактори parser.py"
+    assert s2.reference_files == [r"F:\other\src.py"], "файл-джерело не зберігся"
+    s2.remove_reference(r"F:\other\src.py")
+    assert s2.reference_files == [], "видалення джерела не спрацювало"
 
     # другий чат -> у списку обидва, нові згори
     s3 = new_session("Інший проект", r"F:\proj\other")

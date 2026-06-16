@@ -26,13 +26,25 @@ class Session:
     project_root: str
     permissions: dict = field(default_factory=lambda: dict(DEFAULT_PERMISSIONS))
     init_scan: bool = False
-    messages: list = field(default_factory=list)   # [{role, content, kind, meta}]
+    reference_files: list = field(default_factory=list)   # read-only джерела (абс. шляхи)
+    messages: list = field(default_factory=list)          # [{role, content, kind, meta}]
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
 
     def add_message(self, role: str, content: str, kind: str = "text", meta: dict | None = None) -> None:
         self.messages.append({"role": role, "content": content, "kind": kind, "meta": meta or {}})
         self.updated = time.time()
+
+    def add_reference(self, path: str) -> None:
+        p = str(path)
+        if p not in self.reference_files:
+            self.reference_files.append(p)
+            self.updated = time.time()
+
+    def remove_reference(self, path: str) -> None:
+        if str(path) in self.reference_files:
+            self.reference_files.remove(str(path))
+            self.updated = time.time()
 
 
 def _dir(base: str | Path | None = None) -> Path:
