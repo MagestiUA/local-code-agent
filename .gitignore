@@ -6,3 +6,4 @@ __pycache__/
 # робочі/тимчасові артефакти
 _*.txt
 scratch/
+.agent/
