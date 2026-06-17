@@ -67,13 +67,14 @@ def is_allowed(command: str, allow) -> bool:
     return any(c == a or c.startswith(a + " ") for a in allow)
 
 
-def run_shell(command: str, cwd: str | None = None,
-              timeout: int | None = None, allow=None) -> ShellResult:
-    """Виконати команду, ЛИШЕ якщо її префікс у allow-list. shell=False, тож
+def run_shell(command: str, cwd: str | None = None, timeout: int | None = None,
+              allow=None, allow_all: bool = False) -> ShellResult:
+    """Виконати команду. За замовчуванням лише префікси з allow-list; allow_all=True
+    (режим 'ask' після підтвердження) знімає це обмеження. shell=False, тож
     ланцюжки (`a; b`, `a && b`) не інтерпретуються — захист від ін'єкцій."""
     allow = config.ALLOWED_SHELL if allow is None else allow
     timeout = config.SHELL_TIMEOUT if timeout is None else timeout
-    if not is_allowed(command, allow):
+    if not allow_all and not is_allowed(command, allow):
         return ShellResult(False, -1, "", f"заблоковано allow-list: {command!r}")
     try:
         args = shlex.split(command, posix=False)
