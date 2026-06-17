@@ -271,23 +271,30 @@ class State(rx.State):
                            confirm=self._make_confirm(asyncio.get_running_loop()))
 
     async def _run_tool_step(self, step_text: str, ctx: ToolContext, title: str = ""):
-        """Один прохід tool-loop + рендер дій моделі у чат. Повертає (final, log).
-        Спільний для кроків плану і для shell-інтенту (одноразовий запит)."""
+        """Один прохід tool-loop. У чат додає ОДНЕ повідомлення на крок: видимий
+        заголовок + короткий підсумок, а всі дії моделі (списки файлів, diff-и,
+        вивід команд) ховає під кат «хід виконання» (kind=step). Повертає (final, log)."""
         actions: list[tuple[str, str]] = []   # (tool, result) — заповнює on_tool у потоці
         final, log = await asyncio.to_thread(
             lambda: run_step(step_text, ctx, ctx.client,
                              on_tool=lambda n, a, r: actions.append((n, r))))
+
+        parts: list[str] = []
+        for name, result in actions:
+            if name in ("edit_file", "create_from_source"):
+                parts.append(f"**{name}**\n```diff\n{result}\n```")
+            elif name == "run_shell":
+                parts.append(f"**run_shell**\n```\n{result}\n```")
+            else:   # list_dir / read_file тощо
+                parts.append(f"**{name}**\n```\n{result[:4000]}\n```")
+        log_md = "\n\n".join(parts)
+
+        head = title or step_text[:80]
+        content = f"**{head}**"
+        if final:
+            content += f"\n\n{final}"
         async with self:
-            for name, result in actions:
-                if name in ("edit_file", "create_from_source"):
-                    head = title or step_text[:60]
-                    self._append("assistant", f"**{head}**\n```diff\n{result}\n```", "diff")
-                elif name == "run_shell":
-                    self._append("assistant", f"```\n{result}\n```", "shell")
-                else:   # list_dir / read_file тощо — показуємо вміст, не обрізаючи до рядка
-                    self._append("assistant", f"```\n{result[:2000]}\n```", "note")
-            if final:
-                self._append("assistant", final, "answer")
+            self._append("assistant", content, "step", thinking=log_md)
         return final, log
 
     @rx.event(background=True)
@@ -595,10 +602,11 @@ def message_bubble(m: dict) -> rx.Component:
                 rx.cond(
                     m["thinking"] != "",
                     rx.el.details(
-                        rx.el.summary("Роздуми моделі",
-                                      class_name="text-xs text-gray-500 cursor-pointer select-none"),
+                        rx.el.summary(
+                            rx.cond(m["kind"] == "step", "хід виконання", "Роздуми моделі"),
+                            class_name="text-xs text-gray-500 cursor-pointer select-none"),
                         rx.markdown(m["thinking"]),
-                        class_name="mb-2 border-l-2 border-white/10 pl-2",
+                        class_name="mb-2 border-l-2 border-white/10 pl-2 max-h-80 overflow-y-auto",
                     ),
                     rx.fragment(),
                 ),
