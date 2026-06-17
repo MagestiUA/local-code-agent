@@ -4,10 +4,12 @@ G3: керування сесіями через бекенд (agent/session.py)
 тека, дозволи, план-наперед, джерела — зберігаються в сесію.
 Прив'язки runner (answer/shell/plan/edit) — G4.
 """
+import asyncio
 from pathlib import Path
 
 import reflex as rx
 
+from agent import runner
 from agent import session as sess
 
 BG = "#262624"
@@ -28,6 +30,14 @@ class State(rx.State):
     references: list[str] = []
     folder_input: str = ""
     ref_input: str = ""
+    task: str = ""
+    messages: list[dict] = []
+    has_pending: bool = False
+    busy: bool = False
+
+    @rx.event
+    def set_task(self, v: str):
+        self.task = v
 
     @rx.var
     def folder_name(self) -> str:
@@ -58,6 +68,15 @@ class State(rx.State):
         self.shell = s.permissions.get("shell", "allowlist")
         self.plan_first = s.plan_first
         self.references = list(s.reference_files)
+        self.messages = list(s.messages)
+        self.has_pending = s.pending_plan is not None
+
+    def _append(self, role: str, content: str, kind: str = "text"):
+        self.messages = self.messages + [{"role": role, "content": content, "kind": kind}]
+        if self.current_id:
+            s = sess.load_session(self.current_id)
+            s.messages = list(self.messages)
+            sess.save_session(s)
 
     def _save_current(self):
         if not self.current_id:
@@ -116,6 +135,65 @@ class State(rx.State):
     def remove_ref(self, r: str):
         self.references = [x for x in self.references if x != r]
         self._save_current()
+
+    @rx.event(background=True)
+    async def send_task(self):
+        async with self:
+            if not self.current_id:
+                return
+            if not self.project_root:
+                self._append("assistant", "Спершу вкажіть робочу теку.", "note")
+                return
+            text = self.task.strip()
+            if not text or self.busy:
+                return
+            self.task = ""
+            self._append("user", text)
+            self.busy = True
+            root, refs = self.project_root, list(self.references)
+            plan_first = self.plan_first or self.edits == "ask"
+
+        res = await asyncio.to_thread(
+            lambda: runner.handle(text, root=root, reference_files=refs, plan_first=plan_first))
+
+        async with self:
+            self.busy = False
+            if res.mode == "plan":
+                self._append("assistant", res.text, "plan")
+                s = sess.load_session(self.current_id)
+                s.set_pending_plan(res.state)
+                sess.save_session(s)
+                self.has_pending = True
+            else:
+                self._append("assistant", res.text, res.mode)
+
+    @rx.event(background=True)
+    async def execute_pending(self):
+        async with self:
+            if not self.has_pending or not self.current_id or self.busy:
+                return
+            self.busy = True
+            root, cid = self.project_root, self.current_id
+
+        s = sess.load_session(cid)
+        plan = s.get_pending_plan()
+        res = await asyncio.to_thread(lambda: runner.execute_plan(plan, root=root))
+
+        async with self:
+            self.busy = False
+            self._append("assistant", res.text, "edit")
+            s2 = sess.load_session(self.current_id)
+            s2.clear_pending_plan()
+            sess.save_session(s2)
+            self.has_pending = False
+
+    @rx.event
+    def discard_pending(self):
+        if self.current_id:
+            s = sess.load_session(self.current_id)
+            s.clear_pending_plan()
+            sess.save_session(s)
+        self.has_pending = False
 
 
 def nav_item(icon: str, label: str, on_click=None) -> rx.Component:
@@ -218,8 +296,10 @@ def controls_bar() -> rx.Component:
         rx.spacer(),
         rx.text("план наперед", class_name="text-xs text-gray-500"),
         rx.switch(checked=State.plan_first, on_change=State.set_plan_first, size="1"),
-        rx.button(rx.icon("arrow-up", size=16), size="1", radius="full",
-                  class_name="bg-white text-black ml-1"),
+        rx.button(
+            rx.cond(State.busy, rx.spinner(size="1"), rx.icon("arrow-up", size=16)),
+            on_click=State.send_task, disabled=State.busy,
+            size="1", radius="full", class_name="bg-white text-black ml-1"),
         class_name="w-full items-center mt-2 gap-2",
     )
 
@@ -246,6 +326,8 @@ def input_box() -> rx.Component:
     return rx.box(
         rx.text_area(
             placeholder="Опишіть задачу...",
+            value=State.task,
+            on_change=State.set_task,
             class_name="w-full bg-transparent text-gray-100 placeholder:text-gray-500 "
                        "resize-none outline-none border-none text-base",
             rows="2",
@@ -257,18 +339,52 @@ def input_box() -> rx.Component:
     )
 
 
+def message_bubble(m: dict) -> rx.Component:
+    mine = m["role"] == "user"
+    return rx.box(
+        rx.text(m["content"], class_name="whitespace-pre-wrap text-gray-100 text-sm"),
+        class_name=rx.cond(mine, "self-end bg-white/10", "self-start bg-white/[0.03]")
+        + " rounded-2xl px-4 py-2.5 max-w-[85%]",
+    )
+
+
+def pending_bar() -> rx.Component:
+    return rx.hstack(
+        rx.button("Виконати план", on_click=State.execute_pending,
+                  class_name="bg-white text-black rounded-lg px-3 py-1.5 text-sm"),
+        rx.button("Відхилити", on_click=State.discard_pending, variant="soft", size="2"),
+        class_name="self-start gap-2 mt-1",
+    )
+
+
+def chat_view() -> rx.Component:
+    return rx.vstack(
+        rx.foreach(State.messages, message_bubble),
+        rx.cond(State.has_pending, pending_bar(), rx.fragment()),
+        class_name="w-full max-w-2xl mx-auto flex-1 overflow-y-auto px-4 py-6 gap-3",
+    )
+
+
 def main_area() -> rx.Component:
-    return rx.center(
+    return rx.cond(
+        State.messages,
         rx.vstack(
-            rx.heading(
-                rx.cond(State.has_current, State.title, "Back at it, Микола"),
-                class_name="text-4xl text-gray-200 mb-2", style=SERIF,
-            ),
-            input_box(),
-            spacing="5",
-            class_name="w-full max-w-2xl items-center px-4",
+            chat_view(),
+            rx.box(input_box(), class_name="w-full px-4 pb-4 flex justify-center"),
+            class_name="flex-1 h-full w-full",
         ),
-        class_name="flex-1 h-full",
+        rx.center(
+            rx.vstack(
+                rx.heading(
+                    rx.cond(State.has_current, State.title, "Back at it, Микола"),
+                    class_name="text-4xl text-gray-200 mb-2", style=SERIF,
+                ),
+                input_box(),
+                spacing="5",
+                class_name="w-full max-w-2xl items-center px-4",
+            ),
+            class_name="flex-1 h-full",
+        ),
     )
 
 
