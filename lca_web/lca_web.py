@@ -5,13 +5,14 @@ G3: керування сесіями через бекенд (agent/session.py)
 Прив'язки runner (answer/shell/plan/edit) — G4.
 """
 import asyncio
+import re
 from pathlib import Path
 
 import reflex as rx
 
 from agent import session as sess
 from agent.answerer import answer, build_context
-from agent.executor import apply_edit, run_edit
+from agent.executor import apply_edit, create_from_source, run_edit
 from agent.intent import classify_intent, extract_command
 from agent.llm import OllamaClient
 from agent.memory import render_for_planner
@@ -30,16 +31,19 @@ def get_client() -> OllamaClient:
 
 
 def _det_handler(step, root: str) -> str:
-    """Обробник deterministic-кроків: тести -> pytest, решта -> вручну."""
+    """Обробник deterministic-кроків: запуск тестів -> pytest, решта -> примітка.
+    Перевіряємо дієслово запуску + слово 'тест', щоб не ловити 'test' у назві файлу."""
     d = step.description.lower()
-    if "test" in d or "тест" in d:
+    is_run_tests = "pytest" in d or (
+        ("прогн" in d or "запуст" in d or "run" in d) and ("тест" in d or "test" in d))
+    if is_run_tests:
         r = run_shell("pytest -q", cwd=root)
         if not r.allowed:
             return "pytest заблоковано allow-list"
         if r.returncode == -1:
             return "тести пропущено (pytest недоступний)"
         return f"pytest завершився з кодом {r.returncode}"
-    return "deterministic-крок: виконати вручну"
+    return "крок не автоматизовано (файлові операції зробить llm-крок)"
 
 
 BG = "#262624"
@@ -213,6 +217,22 @@ class State(rx.State):
         self.references = [x for x in self.references if x != r]
         self._save_current()
 
+    def _find_source(self, root: str, task: str, step) -> Path | None:
+        """Знайти файл-джерело для створення нового: згаданий у задачі/кроці
+        наявний .py (крім самого target), інакше — перший reference-файл."""
+        target_name = Path(step.target).name if step.target else ""
+        for n in re.findall(r"[\w.\-]+\.py", (task or "") + " " + (step.description or "")):
+            nm = Path(n).name
+            if nm == target_name:
+                continue
+            p = Path(root) / nm
+            if p.exists():
+                return p
+        for rf in self.references:
+            if str(rf).endswith(".py") and Path(rf).exists():
+                return Path(rf)
+        return None
+
     async def _execute_steps(self, plan, root: str, client):
         """Виконати кроки плану, показуючи diff/результат кожного в чаті."""
         for step in plan.steps:
@@ -234,13 +254,22 @@ class State(rx.State):
                     self._append("assistant", f"Крок #{step.id}: пропущено (немає цільового файлу).", "note")
                 continue
             target = Path(root) / step.target
-            if not target.exists():
-                plan.set_result(step.id, "failed", "файл не знайдено")
+            if target.exists():
+                res = await asyncio.to_thread(
+                    lambda t=target, s=step: run_edit(t, s.description, client, False))
+            else:
+                src = self._find_source(root, plan.task, step)
+                if not src:
+                    plan.set_result(step.id, "failed", "нема джерела")
+                    async with self:
+                        self._append("assistant",
+                                     f"Крок #{step.id}: не знайдено джерело для створення {step.target}.",
+                                     "note")
+                    continue
                 async with self:
-                    self._append("assistant", f"Крок #{step.id}: файл {step.target} не знайдено.", "note")
-                continue
-            res = await asyncio.to_thread(
-                lambda t=target, s=step: run_edit(t, s.description, client, False))
+                    self.status = f"Створюю {step.target} з {Path(src).name}…"
+                res = await asyncio.to_thread(
+                    lambda t=target, s=step, sr=src: create_from_source(t, sr, s.description, client))
             if not res.ok:
                 plan.set_result(step.id, "failed", res.error)
                 async with self:

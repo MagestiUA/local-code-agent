@@ -78,6 +78,38 @@ def run_edit(path: str | Path, instruction: str,
     return EditResult(True, final, diff, "", backup)
 
 
+def create_from_source(target: str | Path, source_path: str | Path, instruction: str,
+                       client: OllamaClient | None = None,
+                       project_doc: str | None = None) -> EditResult:
+    """Створити НОВИЙ файл на основі джерела (read-only). Літерали джерела
+    переносяться verbatim через strip/restore (модель їх не бачить)."""
+    client = client or OllamaClient()
+    original = tools.read_file(source_path)
+    stripped, mapping = strip_code(original)
+    preamble = f"Project context:\n{project_doc}\n\n" if project_doc else ""
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user",
+         "content": f"{preamble}Instruction:\n{instruction}\n\n"
+                    f"Base the NEW file on this source `{Path(source_path).name}`:\n"
+                    f"```python\n{stripped}\n```\nReturn the COMPLETE new file."},
+    ]
+    msg = client.chat(messages, profile=config.EXECUTOR)
+    new_stripped = _extract_code(msg.get("content") or "")
+
+    ok, err = tools.validate_python(new_stripped)
+    if not ok:
+        return EditResult(False, None, "", f"вивід LLM невалідний: {err}", None)
+
+    final = restore_code(new_stripped, mapping)
+    ok2, err2 = tools.validate_python(final)
+    if not ok2:
+        return EditResult(False, None, "", f"після restore невалідно: {err2}", None)
+
+    diff = tools.unified_diff("", final, str(Path(target).name))
+    return EditResult(True, final, diff, "", None)
+
+
 def apply_edit(path: str | Path, result: EditResult) -> str | None:
     """Записати СХВАЛЕНУ правку з бекапом. Викликати після показу diff і згоди
     користувача (CLI/GUI). Повертає шлях бекапу."""
