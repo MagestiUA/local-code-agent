@@ -1,13 +1,13 @@
 """local-code-agent — веб-інтерфейс на Reflex (каркас у стилі Claude).
 
-G2: статична розкладка (сайдбар + центрований greeting + поле вводу).
+G2: статична розкладка (сайдбар + greeting + поле вводу з панеллю керування).
 Прив'язки до бекенду ще немає (G3+).
 """
 import reflex as rx
 
 # Тепла темна палітра, близька до Claude.ai
 BG = "#262624"        # основний фон
-PANEL = "#1f1e1d"     # сайдбар
+PANEL = "#171615"     # сайдбар (темніший за основний)
 INPUT = "#30302e"     # поле вводу
 BORDER = "border-white/10"
 SERIF = {"fontFamily": "Newsreader, Georgia, serif"}
@@ -18,12 +18,32 @@ def sidebar() -> rx.Component:
         rx.button(
             rx.icon("plus", size=16), "Новий чат",
             class_name="w-full justify-start gap-2 bg-transparent hover:bg-white/5 "
-                       "text-gray-200 rounded-lg px-3 py-2 text-sm border " + BORDER,
+                       "text-gray-100 rounded-lg px-3 py-2 text-sm border " + BORDER,
         ),
-        rx.text("Чати", class_name="text-xs text-gray-500 mt-4 mb-1 px-1"),
-        rx.text("Поки немає чатів", class_name="text-sm text-gray-500 px-1"),
+        rx.text("Чати", class_name="text-xs text-gray-400 mt-4 mb-1 px-1"),
+        rx.text("Поки немає чатів", class_name="text-sm text-gray-300 px-1"),
         class_name="w-64 h-full p-3 flex flex-col gap-1 border-r " + BORDER,
         style={"backgroundColor": PANEL},
+    )
+
+
+def controls_bar() -> rx.Component:
+    """Дрібна панель керування під полем вводу: тека, дозволи, план-наперед, send."""
+    return rx.hstack(
+        rx.button(rx.icon("plus", size=16), variant="ghost", size="1",
+                  class_name="text-gray-400"),
+        rx.button(rx.icon("folder", size=14), "тека", variant="ghost", size="1",
+                  class_name="text-gray-400 gap-1"),
+        rx.select(["ask", "auto"], default_value="ask", size="1",
+                  width="5.2rem"),
+        rx.select(["allowlist", "ask", "off"], default_value="allowlist", size="1",
+                  width="6.5rem"),
+        rx.spacer(),
+        rx.text("план наперед", class_name="text-xs text-gray-500"),
+        rx.switch(size="1"),
+        rx.button(rx.icon("arrow-up", size=18), size="1",
+                  class_name="bg-white text-black rounded-lg ml-1"),
+        class_name="w-full items-center mt-2 gap-2",
     )
 
 
@@ -35,14 +55,14 @@ def input_box() -> rx.Component:
                        "resize-none outline-none border-none text-base",
             rows="2",
         ),
+        controls_bar(),
         rx.hstack(
-            rx.button(rx.icon("plus", size=18),
-                      class_name="bg-transparent hover:bg-white/10 text-gray-400 rounded-lg p-1"),
-            rx.spacer(),
-            rx.text("answer", class_name="text-xs text-gray-500"),
-            rx.button(rx.icon("arrow-up", size=18),
-                      class_name="bg-white/90 hover:bg-white text-black rounded-lg p-1"),
-            class_name="w-full items-center mt-2 gap-2",
+            rx.icon("lock", size=12, class_name="text-gray-500"),
+            rx.text("джерела:", class_name="text-xs text-gray-500"),
+            rx.text("нема", class_name="text-xs text-gray-500"),
+            rx.button(rx.icon("plus", size=12), "файл", variant="ghost", size="1",
+                      class_name="text-gray-400"),
+            class_name="items-center gap-2 mt-1",
         ),
         class_name="w-full max-w-2xl rounded-2xl p-3 border " + BORDER,
         style={"backgroundColor": INPUT},
