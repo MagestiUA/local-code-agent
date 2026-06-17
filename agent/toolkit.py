@@ -79,12 +79,24 @@ def h_read_file(args, ctx):
     p = _resolve(ctx, args.get("path", ""))
     if not p.is_file():
         return f"файл не знайдено: {args.get('path')}"
-    return T.read_file(p)[:8000]
+    text = T.read_file(p)
+    if len(text) > 8000:
+        return (text[:8000] +
+                f"\n\n…[обрізано: показано 8000 з {len(text)} символів]. НЕ копіюй вміст "
+                "вручну — для дублювання у новий файл клич create_from_source, для зміни на "
+                "місці — edit_file (вони зберігають великі дані-літерали байт-у-байт).")
+    return text
 
 
 def h_write_file(args, ctx):
-    p = _resolve(ctx, args.get("path", ""))
+    rel = (args.get("path") or "").strip()
+    if not rel:
+        return "помилка: не вказано path для write_file"
+    p = _resolve(ctx, rel)
+    if p.is_dir():
+        return f"помилка: '{rel}' — це тека, а не файл"
     content = args.get("content", "")
+    p.parent.mkdir(parents=True, exist_ok=True)
     T.backup_file(p)
     T.write_file(p, content)
     return f"записано {p.name} ({len(content)} символів)"
@@ -150,8 +162,13 @@ def default_registry() -> ToolRegistry:
                     {"path": {"type": "string"}, "instruction": {"type": "string"}},
                     ["path", "instruction"], h_edit_file))
     r.register(Tool("create_from_source",
-                    "Створити НОВИЙ .py файл на основі наявного файлу-джерела.",
-                    {"target": {"type": "string"}, "source": {"type": "string"},
-                     "instruction": {"type": "string"}},
+                    "Створити НОВИЙ файл як копію наявного файлу-джерела з опційним "
+                    "рефакторингом. ЦЕ ЄДИНИЙ ПРАВИЛЬНИЙ спосіб скопіювати/продублювати "
+                    "файл у новий: великі дані-літерали копіюються байт-у-байт. Використовуй "
+                    "замість ручного read_file+write_file і замість shell-copy.",
+                    {"target": {"type": "string", "description": "новий файл"},
+                     "source": {"type": "string", "description": "наявний файл-джерело"},
+                     "instruction": {"type": "string",
+                                     "description": "що змінити; '' якщо просто копія"}},
                     ["target", "source", "instruction"], h_create_from_source))
     return r

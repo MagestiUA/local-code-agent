@@ -14,10 +14,16 @@ from .toolkit import ToolContext, ToolRegistry, default_registry
 
 SYSTEM = (
     "You are an execution agent for ONE task step on a Windows machine (PowerShell). "
-    "You have tools. Accomplish the step using them: inspect with list_dir/read_file, "
-    "create/overwrite files with write_file, refactor existing .py with edit_file, create "
-    "a new .py from a source with create_from_source, run programs with run_shell. Use the "
-    "file tools for file operations (do not rely on shell cmdlets). When the step is done, "
+    "You have tools — pick the RIGHT one:\n"
+    "- To DUPLICATE an existing file into a NEW file (copy, optionally refactored): call "
+    "create_from_source ONCE (target=new file, source=existing file, instruction=what to "
+    "change or '' for a plain copy). It copies large data literals byte-for-byte. NEVER "
+    "read a big file and rewrite it by hand, and NEVER use shell copy/cp for this.\n"
+    "- To CHANGE an existing .py in place: call edit_file (path, instruction).\n"
+    "- To create a small brand-new file from scratch: call write_file (path, content) — "
+    "always pass a non-empty path that points to a FILE, not a folder.\n"
+    "- To inspect: list_dir, read_file. To run programs (python/pytest/git): run_shell.\n"
+    "Use the file tools for file operations, not shell cmdlets. When the step is done, "
     "reply with a SHORT confirmation and NO tool call. Reply in the user's language."
 )
 

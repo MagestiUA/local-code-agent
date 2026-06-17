@@ -33,10 +33,24 @@ def main() -> None:
     ctx_off = ToolContext(root=root, permissions={"edits": "auto", "shell": "off"})
     assert "вимкнена" in reg.dispatch("run_shell", {"command": "python --version"}, ctx_off)
 
+    # write_file захист: порожній path і тека
+    assert "не вказано path" in reg.dispatch("write_file", {"content": "x"}, ctx)
+    assert "не вказано path" in reg.dispatch("write_file", {"path": "  ", "content": "x"}, ctx)
+    (root / "sub").mkdir()
+    assert "це тека" in reg.dispatch("write_file", {"path": "sub", "content": "x"}, ctx)
+    # write_file створює батьківські теки
+    assert "записано" in reg.dispatch("write_file", {"path": "deep/n/c.txt", "content": "y"}, ctx)
+    assert (root / "deep" / "n" / "c.txt").read_text(encoding="utf-8") == "y"
+
+    # read_file великого файлу обрізає й підказує create_from_source
+    (root / "big.py").write_text("# c\n" * 5000, encoding="utf-8")
+    big = reg.dispatch("read_file", {"path": "big.py"}, ctx)
+    assert "обрізано" in big and "create_from_source" in big
+
     # невідомий тул
     assert "невідомий" in reg.dispatch("nope", {}, ctx)
 
-    print("OK: реєстр — схема, read/write/list/run_shell, дозволи, невідомий тул")
+    print("OK: реєстр — схема, read/write/list/run_shell, дозволи, захист write/read, невідомий тул")
     print(f"  інструменти: {reg.names()}")
 
 
