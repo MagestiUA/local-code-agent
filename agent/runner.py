@@ -25,13 +25,14 @@ from .tools import run_shell
 
 @dataclass
 class TaskResult:
-    mode: str                       # answer | shell | edit
+    mode: str                       # answer | shell | plan | edit
     text: str                       # відповідь / вивід / підсумок плану
-    state: TaskState | None = None  # для edit
+    state: TaskState | None = None  # план (для plan/edit)
 
 
 def handle(task: str, root: str | Path = ".", client: OllamaClient | None = None,
-           reference_files=(), confirm=None, det_handler=None) -> TaskResult:
+           reference_files=(), confirm=None, det_handler=None,
+           plan_first: bool = False) -> TaskResult:
     client = client or OllamaClient()
     mode = classify_intent(task, client)
 
@@ -47,9 +48,25 @@ def handle(task: str, root: str | Path = ".", client: OllamaClient | None = None
         body = (r.stdout or r.stderr or "").strip()
         return TaskResult("shell", f"$ {cmd}\n{body}\n(rc={r.returncode})")
 
-    # edit
+    # plan або edit — спершу будуємо план
     doc = load_project_doc(root)
     state = make_plan(task, client=client, project_doc=doc)
+
+    # plan-режим (явний намір або plan_first сесії): показати план, НЕ виконувати
+    if mode == "plan" or plan_first:
+        return TaskResult("plan", render_for_planner(state), state)
+
+    # edit: виконати одразу
+    run_plan(state, client,
+             confirm=confirm or (lambda step, diff: True),
+             root=str(root), det_handler=det_handler)
+    return TaskResult("edit", render_for_planner(state), state)
+
+
+def execute_plan(state: TaskState, client: OllamaClient | None = None,
+                 confirm=None, root: str | Path = ".", det_handler=None) -> TaskResult:
+    """Виконати раніше схвалений (pending) план."""
+    client = client or OllamaClient()
     run_plan(state, client,
              confirm=confirm or (lambda step, diff: True),
              root=str(root), det_handler=det_handler)

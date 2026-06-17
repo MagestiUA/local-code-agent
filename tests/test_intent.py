@@ -14,12 +14,13 @@ class Stub:
 
 def main() -> None:
     assert classify_intent("відрефактори parser.py", Stub('{"mode": "edit"}')) == "edit"
+    assert classify_intent("давай спершу сплануємо", Stub('{"mode": "plan"}')) == "plan"
     assert classify_intent("що робить ця функція?", Stub('{"mode": "answer"}')) == "answer"
     assert classify_intent("запусти тести", Stub('{"mode": "shell"}')) == "shell"
     # нерозбірливе / зламане -> безпечний дефолт answer
     assert classify_intent("???", Stub("not json")) == "answer"
     assert classify_intent("???", Stub('{"mode": "wat"}')) == "answer"
-    print("OK: класифікація наміру edit/answer/shell + дефолт answer")
+    print("OK: класифікація наміру edit/plan/answer/shell + дефолт answer")
 
 
 if __name__ == "__main__":

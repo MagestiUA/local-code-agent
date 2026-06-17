@@ -11,19 +11,21 @@ import json
 from . import config
 from .llm import OllamaClient
 
-MODES = {"edit", "answer", "shell"}
+MODES = {"edit", "answer", "shell", "plan"}
 
 SYSTEM = (
     "Classify the user's request into exactly one mode:\n"
-    "- 'edit': modify, refactor, create, or delete code or files.\n"
+    "- 'edit': modify, refactor, create, or delete code or files right away.\n"
+    "- 'plan': the user wants to plan or discuss the approach FIRST, without making "
+    "changes yet (e.g. 'let's plan', 'how would you approach', 'don't code yet').\n"
     "- 'answer': explain, analyze, or ask about the code/project; NO changes made.\n"
     "- 'shell': run a command (tests, list files, build, lint).\n"
-    'Reply ONLY as JSON: {"mode": "edit|answer|shell"}.'
+    'Reply ONLY as JSON: {"mode": "edit|plan|answer|shell"}.'
 )
 
 SCHEMA = {
     "type": "object",
-    "properties": {"mode": {"type": "string", "enum": ["edit", "answer", "shell"]}},
+    "properties": {"mode": {"type": "string", "enum": ["edit", "plan", "answer", "shell"]}},
     "required": ["mode"],
 }
 

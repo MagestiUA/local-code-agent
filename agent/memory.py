@@ -60,10 +60,16 @@ def save(state: TaskState, root: str | Path = ".", name: str = "current") -> Pat
     return p
 
 
+def state_from_dict(data: dict) -> TaskState:
+    """Відновити TaskState зі словника (для сесій / pending-планів)."""
+    steps = [Step(**s) for s in data.get("steps", [])]
+    rest = {k: v for k, v in data.items() if k != "steps"}
+    return TaskState(steps=steps, **rest)
+
+
 def load(root: str | Path = ".", name: str = "current") -> TaskState:
     data = json.loads(state_path(root, name).read_text(encoding="utf-8"))
-    steps = [Step(**s) for s in data.pop("steps")]
-    return TaskState(steps=steps, **data)
+    return state_from_dict(data)
 
 
 def render_for_planner(state: TaskState) -> str:

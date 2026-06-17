@@ -26,7 +26,9 @@ class Session:
     project_root: str
     permissions: dict = field(default_factory=lambda: dict(DEFAULT_PERMISSIONS))
     init_scan: bool = False
+    plan_first: bool = False                              # завжди планувати наперед
     reference_files: list = field(default_factory=list)   # read-only джерела (абс. шляхи)
+    pending_plan: dict | None = None                      # план, що очікує виконання
     messages: list = field(default_factory=list)          # [{role, content, kind, meta}]
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
@@ -45,6 +47,18 @@ class Session:
         if str(path) in self.reference_files:
             self.reference_files.remove(str(path))
             self.updated = time.time()
+
+    def set_pending_plan(self, state) -> None:
+        self.pending_plan = asdict(state)
+        self.updated = time.time()
+
+    def get_pending_plan(self):
+        from .memory import state_from_dict
+        return state_from_dict(self.pending_plan) if self.pending_plan else None
+
+    def clear_pending_plan(self) -> None:
+        self.pending_plan = None
+        self.updated = time.time()
 
 
 def _dir(base: str | Path | None = None) -> Path:

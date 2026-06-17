@@ -28,6 +28,20 @@ def main() -> None:
     s2.remove_reference(r"F:\other\src.py")
     assert s2.reference_files == [], "видалення джерела не спрацювало"
 
+    # pending-план + plan_first round-trip
+    from agent.memory import TaskState
+    plan = TaskState(task="p")
+    plan.add_step("llm", "крок А", target="a.py")
+    s.plan_first = True
+    s.set_pending_plan(plan)
+    save_session(s, base=base)
+    s3 = load_session(s.id, base=base)
+    assert s3.plan_first is True
+    pp = s3.get_pending_plan()
+    assert pp is not None and pp.steps[0].description == "крок А"
+    s3.clear_pending_plan()
+    assert s3.get_pending_plan() is None
+
     # другий чат -> у списку обидва, нові згори
     s3 = new_session("Інший проект", r"F:\proj\other")
     save_session(s3, base=base)
