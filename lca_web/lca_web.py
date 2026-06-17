@@ -1,35 +1,156 @@
-"""local-code-agent — веб-інтерфейс на Reflex (каркас у стилі Claude).
+"""local-code-agent — веб-інтерфейс на Reflex (стиль Claude).
 
-G2: статична розкладка (сайдбар зі структурою + greeting + поле вводу).
-Прив'язки до бекенду ще немає (G3+).
+G3: керування сесіями через бекенд (agent/session.py): створення/список/вибір,
+тека, дозволи, план-наперед, джерела — зберігаються в сесію.
+Прив'язки runner (answer/shell/plan/edit) — G4.
 """
+from pathlib import Path
+
 import reflex as rx
 
-# Тепла темна палітра, близька до Claude.ai
-BG = "#262624"        # основний фон
-PANEL = "#171615"     # сайдбар (темніший за основний)
-INPUT = "#30302e"     # поле вводу
+from agent import session as sess
+
+BG = "#262624"
+PANEL = "#171615"
+INPUT = "#30302e"
 BORDER = "border-white/10"
 SERIF = {"fontFamily": "Newsreader, Georgia, serif"}
 
 
-def nav_item(icon: str, label: str) -> rx.Component:
+class State(rx.State):
+    sessions: list[dict] = []
+    current_id: str = ""
+    title: str = ""
+    project_root: str = ""
+    edits: str = "ask"
+    shell: str = "allowlist"
+    plan_first: bool = False
+    references: list[str] = []
+    folder_input: str = ""
+    ref_input: str = ""
+
+    @rx.var
+    def folder_name(self) -> str:
+        return Path(self.project_root).name if self.project_root else "тека"
+
+    @rx.var
+    def has_current(self) -> bool:
+        return self.current_id != ""
+
+    @rx.event
+    def set_folder_input(self, v: str):
+        self.folder_input = v
+
+    @rx.event
+    def set_ref_input(self, v: str):
+        self.ref_input = v
+
+    @rx.event
+    def load_sessions(self):
+        self.sessions = sess.list_sessions()
+
+    def _select(self, sid: str):
+        s = sess.load_session(sid)
+        self.current_id = s.id
+        self.title = s.title
+        self.project_root = s.project_root
+        self.edits = s.permissions.get("edits", "ask")
+        self.shell = s.permissions.get("shell", "allowlist")
+        self.plan_first = s.plan_first
+        self.references = list(s.reference_files)
+
+    def _save_current(self):
+        if not self.current_id:
+            return
+        s = sess.load_session(self.current_id)
+        s.title = self.title or s.title
+        s.project_root = self.project_root
+        s.permissions = {"edits": self.edits, "shell": self.shell}
+        s.plan_first = self.plan_first
+        s.reference_files = list(self.references)
+        sess.save_session(s)
+        self.sessions = sess.list_sessions()
+
+    @rx.event
+    def new_chat(self):
+        s = sess.new_session("Новий чат", "")
+        sess.save_session(s)
+        self.sessions = sess.list_sessions()
+        self._select(s.id)
+
+    @rx.event
+    def select_chat(self, sid: str):
+        self._select(sid)
+
+    @rx.event
+    def set_edits(self, v: str):
+        self.edits = v
+        self._save_current()
+
+    @rx.event
+    def set_shell(self, v: str):
+        self.shell = v
+        self._save_current()
+
+    @rx.event
+    def set_plan_first(self, v: bool):
+        self.plan_first = v
+        self._save_current()
+
+    @rx.event
+    def save_folder(self):
+        self.project_root = self.folder_input.strip()
+        if self.project_root and self.title in ("", "Новий чат"):
+            self.title = Path(self.project_root).name
+        self._save_current()
+
+    @rx.event
+    def add_ref(self):
+        r = self.ref_input.strip()
+        if r and r not in self.references:
+            self.references = self.references + [r]
+        self.ref_input = ""
+        self._save_current()
+
+    @rx.event
+    def remove_ref(self, r: str):
+        self.references = [x for x in self.references if x != r]
+        self._save_current()
+
+
+def nav_item(icon: str, label: str, on_click=None) -> rx.Component:
     return rx.hstack(
         rx.icon(icon, size=16, class_name="text-gray-400"),
         rx.text(label, class_name="text-sm text-gray-200"),
+        on_click=on_click,
         class_name="items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-white/5 "
                    "cursor-pointer w-full",
     )
 
 
+def session_item(s: dict) -> rx.Component:
+    active = State.current_id == s["id"]
+    return rx.hstack(
+        rx.icon("message-square", size=14, class_name="text-gray-500"),
+        rx.text(s["title"], class_name="text-sm text-gray-200 truncate"),
+        on_click=lambda: State.select_chat(s["id"]),
+        class_name=rx.cond(active, "bg-white/10", "hover:bg-white/5")
+        + " items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer w-full",
+    )
+
+
 def sidebar() -> rx.Component:
     return rx.flex(
-        nav_item("plus", "Новий чат"),
+        nav_item("plus", "Новий чат", State.new_chat),
         nav_item("settings", "Налаштування"),
         rx.text("Recents", class_name="text-xs text-gray-500 uppercase tracking-wide "
                                        "mt-5 mb-1 px-2"),
         rx.vstack(
-            rx.text("Поки немає чатів", class_name="text-sm text-gray-400 px-2"),
+            rx.cond(
+                State.sessions,
+                rx.foreach(State.sessions, session_item),
+                rx.text("Поки немає чатів", class_name="text-sm text-gray-400 px-2"),
+            ),
             class_name="flex-1 w-full gap-0.5 overflow-y-auto",
         ),
         rx.spacer(),
@@ -45,22 +166,79 @@ def sidebar() -> rx.Component:
     )
 
 
+def folder_dialog() -> rx.Component:
+    return rx.dialog.root(
+        rx.dialog.trigger(
+            rx.button(rx.icon("folder", size=14), State.folder_name, variant="ghost",
+                      size="1", class_name="text-gray-300 gap-1"),
+        ),
+        rx.dialog.content(
+            rx.dialog.title("Робоча тека проєкту"),
+            rx.input(placeholder="Абсолютний шлях до папки",
+                     value=State.folder_input, on_change=State.set_folder_input,
+                     class_name="w-full mt-2"),
+            rx.flex(
+                rx.dialog.close(rx.button("Скасувати", variant="soft")),
+                rx.dialog.close(rx.button("Зберегти", on_click=State.save_folder)),
+                spacing="2", justify="end", class_name="mt-3",
+            ),
+        ),
+    )
+
+
+def ref_dialog() -> rx.Component:
+    return rx.dialog.root(
+        rx.dialog.trigger(
+            rx.button(rx.icon("plus", size=12), "файл", variant="ghost", size="1",
+                      class_name="text-gray-400"),
+        ),
+        rx.dialog.content(
+            rx.dialog.title("Файл-джерело (read-only)"),
+            rx.input(placeholder="Абсолютний шлях до файлу",
+                     value=State.ref_input, on_change=State.set_ref_input,
+                     class_name="w-full mt-2"),
+            rx.flex(
+                rx.dialog.close(rx.button("Скасувати", variant="soft")),
+                rx.dialog.close(rx.button("Додати", on_click=State.add_ref)),
+                spacing="2", justify="end", class_name="mt-3",
+            ),
+        ),
+    )
+
+
 def controls_bar() -> rx.Component:
     return rx.hstack(
         rx.button(rx.icon("paperclip", size=15), variant="ghost", size="1",
                   class_name="text-gray-400"),
-        rx.button(rx.icon("folder", size=14), "тека", variant="ghost", size="1",
-                  class_name="text-gray-400 gap-1"),
-        rx.select(["ask", "auto"], default_value="ask", size="1", variant="soft",
-                  width="5rem"),
-        rx.select(["allowlist", "ask", "off"], default_value="allowlist", size="1",
-                  variant="soft", width="6.2rem"),
+        folder_dialog(),
+        rx.select(["ask", "auto"], value=State.edits, on_change=State.set_edits,
+                  size="1", variant="soft", width="5rem"),
+        rx.select(["allowlist", "ask", "off"], value=State.shell, on_change=State.set_shell,
+                  size="1", variant="soft", width="6.2rem"),
         rx.spacer(),
         rx.text("план наперед", class_name="text-xs text-gray-500"),
-        rx.switch(size="1"),
+        rx.switch(checked=State.plan_first, on_change=State.set_plan_first, size="1"),
         rx.button(rx.icon("arrow-up", size=16), size="1", radius="full",
                   class_name="bg-white text-black ml-1"),
         class_name="w-full items-center mt-2 gap-2",
+    )
+
+
+def references_row() -> rx.Component:
+    return rx.hstack(
+        rx.icon("lock", size=12, class_name="text-gray-500"),
+        rx.text("джерела:", class_name="text-xs text-gray-500"),
+        rx.foreach(
+            State.references,
+            lambda r: rx.hstack(
+                rx.text(r, class_name="text-xs text-gray-300 truncate max-w-40"),
+                rx.icon("x", size=11, class_name="text-gray-500 cursor-pointer",
+                        on_click=lambda: State.remove_ref(r)),
+                class_name="items-center gap-1 px-1.5 py-0.5 rounded bg-white/5",
+            ),
+        ),
+        ref_dialog(),
+        class_name="items-center gap-2 mt-1 flex-wrap",
     )
 
 
@@ -73,13 +251,7 @@ def input_box() -> rx.Component:
             rows="2",
         ),
         controls_bar(),
-        rx.hstack(
-            rx.icon("lock", size=12, class_name="text-gray-500"),
-            rx.text("джерела: нема", class_name="text-xs text-gray-500"),
-            rx.button(rx.icon("plus", size=12), "файл", variant="ghost", size="1",
-                      class_name="text-gray-400"),
-            class_name="items-center gap-2 mt-1",
-        ),
+        references_row(),
         class_name="w-full max-w-2xl rounded-2xl p-3 border " + BORDER,
         style={"backgroundColor": INPUT},
     )
@@ -88,8 +260,10 @@ def input_box() -> rx.Component:
 def main_area() -> rx.Component:
     return rx.center(
         rx.vstack(
-            rx.heading("Back at it, Микола",
-                       class_name="text-4xl text-gray-200 mb-2", style=SERIF),
+            rx.heading(
+                rx.cond(State.has_current, State.title, "Back at it, Микола"),
+                class_name="text-4xl text-gray-200 mb-2", style=SERIF,
+            ),
             input_box(),
             spacing="5",
             class_name="w-full max-w-2xl items-center px-4",
@@ -112,4 +286,4 @@ app = rx.App(
     theme=rx.theme(appearance="dark"),
     stylesheets=["https://fonts.googleapis.com/css2?family=Newsreader:ital@0;1&display=swap"],
 )
-app.add_page(index, title="local-code-agent")
+app.add_page(index, title="local-code-agent", on_load=State.load_sessions)
