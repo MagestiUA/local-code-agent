@@ -13,13 +13,12 @@ import reflex as rx
 from agent import session as sess
 from agent.agent_loop import run_step
 from agent.answerer import answer, build_context
-from agent.intent import classify_intent, extract_command
+from agent.intent import classify_intent
 from agent.llm import OllamaClient
 from agent.memory import render_for_planner
 from agent.planner import make_plan
 from agent.project import load_project_doc
 from agent.toolkit import ToolContext
-from agent.tools import run_shell
 
 _CLIENT = None
 
@@ -251,36 +250,45 @@ class State(rx.State):
 
         ToolContext: edits=auto (план уже схвалено — через plan_first або edits=auto).
         shell передаємо як є; для shell=ask confirm показує модальний попап."""
-        loop = asyncio.get_running_loop()
-        ctx = ToolContext(root=Path(root),
-                          permissions={"edits": "auto", "shell": self.shell},
-                          client=client, confirm=self._make_confirm(loop))
+        ctx = self._exec_ctx(root, client)
         for step in plan.steps:
             async with self:
                 self.status = f"Крок #{step.id}: {step.description[:50]}"
             if step.kind == "inline":
                 plan.set_result(step.id, "done", "inline")
                 continue
-
-            actions: list[tuple[str, str]] = []   # (tool_name, result) — заповнює on_tool у потоці
-            final, log = await asyncio.to_thread(
-                lambda s=step, c=ctx: run_step(
-                    s.description, c, client,
-                    on_tool=lambda n, a, r: actions.append((n, r))))
-
+            final, log = await self._run_tool_step(step.description, ctx, title=step.description[:60])
             plan.set_result(step.id, "done" if log else "failed", final or "—")
-            async with self:
-                for name, result in actions:
-                    if name in ("edit_file", "create_from_source"):
-                        self._append("assistant", f"**{step.description[:60]}**\n```diff\n{result}\n```", "diff")
-                    elif name == "run_shell":
-                        self._append("assistant", f"```\n{result}\n```", "shell")
-                    else:
-                        self._append("assistant", f"`{name}` → {result[:200]}", "note")
-                if final:
-                    self._append("assistant", f"Крок #{step.id}: {final}", "note")
         async with self:
             self._append("assistant", "Готово ✓", "note")
+
+    def _exec_ctx(self, root: str, client) -> ToolContext:
+        """ToolContext для виконання: edits=auto (план/запит уже схвалено),
+        shell передаємо як є; для shell=ask confirm показує модальний попап."""
+        return ToolContext(root=Path(root),
+                           permissions={"edits": "auto", "shell": self.shell},
+                           client=client,
+                           confirm=self._make_confirm(asyncio.get_running_loop()))
+
+    async def _run_tool_step(self, step_text: str, ctx: ToolContext, title: str = ""):
+        """Один прохід tool-loop + рендер дій моделі у чат. Повертає (final, log).
+        Спільний для кроків плану і для shell-інтенту (одноразовий запит)."""
+        actions: list[tuple[str, str]] = []   # (tool, result) — заповнює on_tool у потоці
+        final, log = await asyncio.to_thread(
+            lambda: run_step(step_text, ctx, ctx.client,
+                             on_tool=lambda n, a, r: actions.append((n, r))))
+        async with self:
+            for name, result in actions:
+                if name in ("edit_file", "create_from_source"):
+                    head = title or step_text[:60]
+                    self._append("assistant", f"**{head}**\n```diff\n{result}\n```", "diff")
+                elif name == "run_shell":
+                    self._append("assistant", f"```\n{result}\n```", "shell")
+                else:   # list_dir / read_file тощо — показуємо вміст, не обрізаючи до рядка
+                    self._append("assistant", f"```\n{result[:2000]}\n```", "note")
+            if final:
+                self._append("assistant", final, "answer")
+        return final, log
 
     @rx.event(background=True)
     async def send_task(self, form_data: dict | None = None):
@@ -314,14 +322,9 @@ class State(rx.State):
 
         elif mode == "shell":
             async with self:
-                self.status = "Готую команду…"
-            cmd = await asyncio.to_thread(lambda: extract_command(text, client))
-            async with self:
-                self.status = "Виконую: " + cmd
-            r = await asyncio.to_thread(lambda: run_shell(cmd, cwd=root))
-            body = (r.stdout or r.stderr or "").strip() if r.allowed else ("Заблоковано: " + cmd)
-            async with self:
-                self._append("assistant", "```\n$ " + cmd + "\n" + body + "\n```", "shell")
+                self.status = "Виконую запит…"
+            ctx = self._exec_ctx(root, client)
+            await self._run_tool_step(text, ctx)
 
         else:  # plan / edit
             async with self:
