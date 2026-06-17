@@ -75,7 +75,7 @@ class State(rx.State):
         self.messages = self.messages + [{"role": role, "content": content, "kind": kind}]
         if self.current_id:
             s = sess.load_session(self.current_id)
-            s.messages = list(self.messages)
+            s.messages = [dict(m) for m in self.messages]   # розгорнути Reflex-проксі
             sess.save_session(s)
 
     def _save_current(self):
@@ -86,7 +86,7 @@ class State(rx.State):
         s.project_root = self.project_root
         s.permissions = {"edits": self.edits, "shell": self.shell}
         s.plan_first = self.plan_first
-        s.reference_files = list(self.references)
+        s.reference_files = [str(x) for x in self.references]   # розгорнути проксі
         sess.save_session(s)
         self.sessions = sess.list_sessions()
 
