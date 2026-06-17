@@ -11,10 +11,10 @@ import reflex as rx
 
 from agent import session as sess
 from agent.answerer import answer, build_context
+from agent.executor import apply_edit, run_edit
 from agent.intent import classify_intent, extract_command
 from agent.llm import OllamaClient
 from agent.memory import render_for_planner
-from agent.orchestrator import run_plan
 from agent.planner import make_plan
 from agent.project import load_project_doc
 from agent.tools import run_shell
@@ -34,7 +34,11 @@ def _det_handler(step, root: str) -> str:
     d = step.description.lower()
     if "test" in d or "тест" in d:
         r = run_shell("pytest -q", cwd=root)
-        return f"pytest rc={r.returncode}" if r.allowed else "pytest заблоковано allow-list"
+        if not r.allowed:
+            return "pytest заблоковано allow-list"
+        if r.returncode == -1:
+            return "тести пропущено (pytest недоступний)"
+        return f"pytest завершився з кодом {r.returncode}"
     return "deterministic-крок: виконати вручну"
 
 
@@ -164,6 +168,47 @@ class State(rx.State):
         self.references = [x for x in self.references if x != r]
         self._save_current()
 
+    async def _execute_steps(self, plan, root: str, client):
+        """Виконати кроки плану, показуючи diff/результат кожного в чаті."""
+        for step in plan.steps:
+            async with self:
+                self.status = f"Крок #{step.id}: {step.description[:50]}"
+            if step.kind == "inline":
+                plan.set_result(step.id, "done", "inline")
+                continue
+            if step.kind == "deterministic":
+                msg = await asyncio.to_thread(lambda s=step: _det_handler(s, root))
+                plan.set_result(step.id, "done", msg)
+                async with self:
+                    self._append("assistant", f"Крок #{step.id} (deterministic): {msg}", "note")
+                continue
+            # llm
+            if not step.target:
+                plan.set_result(step.id, "failed", "немає файлу")
+                async with self:
+                    self._append("assistant", f"Крок #{step.id}: пропущено (немає цільового файлу).", "note")
+                continue
+            target = Path(root) / step.target
+            if not target.exists():
+                plan.set_result(step.id, "failed", "файл не знайдено")
+                async with self:
+                    self._append("assistant", f"Крок #{step.id}: файл {step.target} не знайдено.", "note")
+                continue
+            res = await asyncio.to_thread(
+                lambda t=target, s=step: run_edit(t, s.description, client, False))
+            if not res.ok:
+                plan.set_result(step.id, "failed", res.error)
+                async with self:
+                    self._append("assistant", f"Крок #{step.id}: помилка — {res.error}", "note")
+                continue
+            await asyncio.to_thread(lambda t=target, r=res: apply_edit(t, r))
+            plan.set_result(step.id, "done", f"+{res.diff.count(chr(10))} рядків")
+            async with self:
+                self._append("assistant",
+                             f"**{step.target}**\n```diff\n{res.diff}\n```", "diff")
+        async with self:
+            self._append("assistant", "Готово ✓", "note")
+
     @rx.event(background=True)
     async def send_task(self):
         async with self:
@@ -218,13 +263,7 @@ class State(rx.State):
                     sess.save_session(s)
                     self.has_pending = True
             else:
-                async with self:
-                    self.status = "Виконую план…"
-                await asyncio.to_thread(lambda: run_plan(
-                    plan, client, confirm=lambda st, d: True, root=root,
-                    det_handler=lambda step: _det_handler(step, root)))
-                async with self:
-                    self._append("assistant", render_for_planner(plan), "edit")
+                await self._execute_steps(plan, root, client)
 
         async with self:
             self.busy = False
@@ -242,14 +281,11 @@ class State(rx.State):
         client = await asyncio.to_thread(get_client)
         s = sess.load_session(cid)
         plan = s.get_pending_plan()
-        await asyncio.to_thread(lambda: run_plan(
-            plan, client, confirm=lambda st, d: True, root=root,
-            det_handler=lambda step: _det_handler(step, root)))
+        await self._execute_steps(plan, root, client)
 
         async with self:
             self.busy = False
             self.status = ""
-            self._append("assistant", render_for_planner(plan), "edit")
             s2 = sess.load_session(self.current_id)
             s2.clear_pending_plan()
             sess.save_session(s2)
