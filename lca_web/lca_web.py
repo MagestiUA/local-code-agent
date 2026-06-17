@@ -65,6 +65,9 @@ class State(rx.State):
     has_pending: bool = False
     busy: bool = False
     status: str = ""
+    rename_open: bool = False
+    rename_id: str = ""
+    rename_input: str = ""
 
     @rx.event
     def set_task(self, v: str):
@@ -132,6 +135,48 @@ class State(rx.State):
     @rx.event
     def select_chat(self, sid: str):
         self._select(sid)
+
+    @rx.event
+    def set_rename_input(self, v: str):
+        self.rename_input = v
+
+    @rx.event
+    def set_rename_open(self, v: bool):
+        self.rename_open = v
+
+    @rx.event
+    def open_rename(self, sid: str, title: str):
+        self.rename_id = sid
+        self.rename_input = title
+        self.rename_open = True
+
+    @rx.event
+    def save_rename(self):
+        if self.rename_id and self.rename_input.strip():
+            s = sess.load_session(self.rename_id)
+            s.title = self.rename_input.strip()
+            sess.save_session(s)
+            if self.current_id == self.rename_id:
+                self.title = s.title
+            self.sessions = sess.list_sessions()
+        self.rename_open = False
+
+    @rx.event
+    def delete_chat(self, sid: str):
+        sess.delete_session(sid)
+        if self.current_id == sid:
+            self.current_id = ""
+            self.title = ""
+            self.project_root = ""
+            self.messages = []
+            self.references = []
+            self.has_pending = False
+        self.sessions = sess.list_sessions()
+
+    @rx.event
+    def on_enter(self, key: str):
+        if key == "Enter":
+            return State.send_task
 
     @rx.event
     def set_edits(self, v: str):
@@ -210,7 +255,7 @@ class State(rx.State):
             self._append("assistant", "Готово ✓", "note")
 
     @rx.event(background=True)
-    async def send_task(self):
+    async def send_task(self, form_data: dict | None = None):
         async with self:
             if not self.current_id:
                 return
@@ -313,11 +358,44 @@ def nav_item(icon: str, label: str, on_click=None) -> rx.Component:
 def session_item(s: dict) -> rx.Component:
     active = State.current_id == s["id"]
     return rx.hstack(
-        rx.icon("message-square", size=14, class_name="text-gray-500"),
-        rx.text(s["title"], class_name="text-sm text-gray-200 truncate"),
-        on_click=lambda: State.select_chat(s["id"]),
+        rx.hstack(
+            rx.icon("message-square", size=14, class_name="text-gray-500 shrink-0"),
+            rx.text(s["title"], class_name="text-sm text-gray-200 truncate"),
+            on_click=lambda: State.select_chat(s["id"]),
+            class_name="items-center gap-2 grow min-w-0 cursor-pointer",
+        ),
+        rx.menu.root(
+            rx.menu.trigger(
+                rx.icon("ellipsis", size=14,
+                        class_name="text-gray-500 hover:text-gray-200 cursor-pointer shrink-0"),
+            ),
+            rx.menu.content(
+                rx.menu.item("Перейменувати",
+                             on_click=lambda: State.open_rename(s["id"], s["title"])),
+                rx.menu.item("Видалити", on_click=lambda: State.delete_chat(s["id"]),
+                             class_name="text-red-400"),
+            ),
+        ),
         class_name=rx.cond(active, "bg-white/10", "hover:bg-white/5")
-        + " items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer w-full",
+        + " items-center gap-1 px-2 py-1.5 rounded-lg w-full",
+    )
+
+
+def rename_dialog() -> rx.Component:
+    return rx.dialog.root(
+        rx.dialog.content(
+            rx.dialog.title("Перейменувати чат"),
+            rx.input(value=State.rename_input, on_change=State.set_rename_input,
+                     class_name="w-full mt-2"),
+            rx.flex(
+                rx.button("Скасувати", variant="soft",
+                          on_click=lambda: State.set_rename_open(False)),
+                rx.button("Зберегти", on_click=State.save_rename),
+                spacing="2", justify="end", class_name="mt-3",
+            ),
+        ),
+        open=State.rename_open,
+        on_open_change=State.set_rename_open,
     )
 
 
@@ -351,8 +429,8 @@ def sidebar() -> rx.Component:
 def folder_dialog() -> rx.Component:
     return rx.dialog.root(
         rx.dialog.trigger(
-            rx.button(rx.icon("folder", size=14), State.folder_name, variant="ghost",
-                      size="1", class_name="text-gray-300 gap-1"),
+            rx.button(rx.icon("folder", size=14), State.folder_name, type="button",
+                      variant="ghost", size="1", class_name="text-gray-300 gap-1"),
         ),
         rx.dialog.content(
             rx.dialog.title("Робоча тека проєкту"),
@@ -371,8 +449,8 @@ def folder_dialog() -> rx.Component:
 def ref_dialog() -> rx.Component:
     return rx.dialog.root(
         rx.dialog.trigger(
-            rx.button(rx.icon("plus", size=12), "файл", variant="ghost", size="1",
-                      class_name="text-gray-400"),
+            rx.button(rx.icon("plus", size=12), "файл", type="button", variant="ghost",
+                      size="1", class_name="text-gray-400"),
         ),
         rx.dialog.content(
             rx.dialog.title("Файл-джерело (read-only)"),
@@ -390,7 +468,7 @@ def ref_dialog() -> rx.Component:
 
 def controls_bar() -> rx.Component:
     return rx.hstack(
-        rx.button(rx.icon("paperclip", size=15), variant="ghost", size="1",
+        rx.button(rx.icon("paperclip", size=15), type="button", variant="ghost", size="1",
                   class_name="text-gray-400"),
         folder_dialog(),
         rx.select(["ask", "auto"], value=State.edits, on_change=State.set_edits,
@@ -402,7 +480,7 @@ def controls_bar() -> rx.Component:
         rx.switch(checked=State.plan_first, on_change=State.set_plan_first, size="1"),
         rx.button(
             rx.cond(State.busy, rx.spinner(size="1"), rx.icon("arrow-up", size=16)),
-            on_click=State.send_task, disabled=State.busy,
+            type="submit", disabled=State.busy,
             size="1", radius="full", class_name="bg-white text-black ml-1"),
         class_name="w-full items-center mt-2 gap-2",
     )
@@ -427,19 +505,25 @@ def references_row() -> rx.Component:
 
 
 def input_box() -> rx.Component:
-    return rx.box(
-        rx.text_area(
-            placeholder="Опишіть задачу...",
-            value=State.task,
-            on_change=State.set_task,
-            class_name="w-full bg-transparent text-gray-100 placeholder:text-gray-500 "
-                       "resize-none outline-none border-none text-base",
-            rows="2",
+    return rx.form(
+        rx.box(
+            rx.text_area(
+                placeholder="Опишіть задачу...  (Enter — надіслати, Shift+Enter — новий рядок)",
+                value=State.task,
+                on_change=State.set_task,
+                enter_key_submit=True,
+                class_name="w-full bg-transparent text-gray-100 placeholder:text-gray-500 "
+                           "resize-none outline-none border-none text-base",
+                rows="2",
+            ),
+            controls_bar(),
+            references_row(),
+            class_name="w-full max-w-2xl rounded-2xl p-3 border " + BORDER,
+            style={"backgroundColor": INPUT},
         ),
-        controls_bar(),
-        references_row(),
-        class_name="w-full max-w-2xl rounded-2xl p-3 border " + BORDER,
-        style={"backgroundColor": INPUT},
+        on_submit=State.send_task,
+        reset_on_submit=False,
+        class_name="w-full flex justify-center",
     )
 
 
@@ -526,6 +610,7 @@ def index() -> rx.Component:
     return rx.hstack(
         sidebar(),
         main_area(),
+        rename_dialog(),
         class_name="h-screen w-screen overflow-hidden",
         style={"backgroundColor": BG},
         spacing="0",

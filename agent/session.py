@@ -89,6 +89,12 @@ def load_session(sid: str, base: str | Path | None = None) -> Session:
     return Session(**data)
 
 
+def delete_session(sid: str, base: str | Path | None = None) -> None:
+    p = _dir(base) / f"{sid}.json"
+    if p.exists():
+        p.unlink()
+
+
 def list_sessions(base: str | Path | None = None) -> list[dict]:
     """Короткий перелік для сайдбара (нові згори)."""
     out = []
