@@ -9,8 +9,34 @@ from pathlib import Path
 
 import reflex as rx
 
-from agent import runner
 from agent import session as sess
+from agent.answerer import answer, build_context
+from agent.intent import classify_intent, extract_command
+from agent.llm import OllamaClient
+from agent.memory import render_for_planner
+from agent.orchestrator import run_plan
+from agent.planner import make_plan
+from agent.project import load_project_doc
+from agent.tools import run_shell
+
+_CLIENT = None
+
+
+def get_client() -> OllamaClient:
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = OllamaClient()
+    return _CLIENT
+
+
+def _det_handler(step, root: str) -> str:
+    """Обробник deterministic-кроків: тести -> pytest, решта -> вручну."""
+    d = step.description.lower()
+    if "test" in d or "тест" in d:
+        r = run_shell("pytest -q", cwd=root)
+        return f"pytest rc={r.returncode}" if r.allowed else "pytest заблоковано allow-list"
+    return "deterministic-крок: виконати вручну"
+
 
 BG = "#262624"
 PANEL = "#171615"
@@ -34,6 +60,7 @@ class State(rx.State):
     messages: list[dict] = []
     has_pending: bool = False
     busy: bool = False
+    status: str = ""
 
     @rx.event
     def set_task(self, v: str):
@@ -68,11 +95,12 @@ class State(rx.State):
         self.shell = s.permissions.get("shell", "allowlist")
         self.plan_first = s.plan_first
         self.references = list(s.reference_files)
-        self.messages = list(s.messages)
+        self.messages = [{"thinking": "", **m} for m in s.messages]
         self.has_pending = s.pending_plan is not None
 
-    def _append(self, role: str, content: str, kind: str = "text"):
-        self.messages = self.messages + [{"role": role, "content": content, "kind": kind}]
+    def _append(self, role: str, content: str, kind: str = "text", thinking: str = ""):
+        self.messages = self.messages + [
+            {"role": role, "content": content, "kind": kind, "thinking": thinking}]
         if self.current_id:
             s = sess.load_session(self.current_id)
             s.messages = [dict(m) for m in self.messages]   # розгорнути Reflex-проксі
@@ -150,22 +178,57 @@ class State(rx.State):
             self.task = ""
             self._append("user", text)
             self.busy = True
-            root, refs = self.project_root, list(self.references)
+            self.status = "Визначаю тип запиту…"
+            root = self.project_root
+            refs = [str(x) for x in self.references]
             plan_first = self.plan_first or self.edits == "ask"
 
-        res = await asyncio.to_thread(
-            lambda: runner.handle(text, root=root, reference_files=refs, plan_first=plan_first))
+        client = await asyncio.to_thread(get_client)
+        mode = await asyncio.to_thread(lambda: classify_intent(text, client))
+
+        if mode == "answer":
+            async with self:
+                self.status = "Аналізую код…"
+            ctx = await asyncio.to_thread(lambda: build_context(root, refs, text))
+            content, thinking = await asyncio.to_thread(lambda: answer(text, ctx, client))
+            async with self:
+                self._append("assistant", content, "answer", thinking)
+
+        elif mode == "shell":
+            async with self:
+                self.status = "Готую команду…"
+            cmd = await asyncio.to_thread(lambda: extract_command(text, client))
+            async with self:
+                self.status = "Виконую: " + cmd
+            r = await asyncio.to_thread(lambda: run_shell(cmd, cwd=root))
+            body = (r.stdout or r.stderr or "").strip() if r.allowed else ("Заблоковано: " + cmd)
+            async with self:
+                self._append("assistant", "```\n$ " + cmd + "\n" + body + "\n```", "shell")
+
+        else:  # plan / edit
+            async with self:
+                self.status = "Складаю план…"
+            doc = await asyncio.to_thread(lambda: load_project_doc(root))
+            plan = await asyncio.to_thread(lambda: make_plan(text, "", client, doc))
+            if plan_first:
+                async with self:
+                    self._append("assistant", render_for_planner(plan), "plan")
+                    s = sess.load_session(self.current_id)
+                    s.set_pending_plan(plan)
+                    sess.save_session(s)
+                    self.has_pending = True
+            else:
+                async with self:
+                    self.status = "Виконую план…"
+                await asyncio.to_thread(lambda: run_plan(
+                    plan, client, confirm=lambda st, d: True, root=root,
+                    det_handler=lambda step: _det_handler(step, root)))
+                async with self:
+                    self._append("assistant", render_for_planner(plan), "edit")
 
         async with self:
             self.busy = False
-            if res.mode == "plan":
-                self._append("assistant", res.text, "plan")
-                s = sess.load_session(self.current_id)
-                s.set_pending_plan(res.state)
-                sess.save_session(s)
-                self.has_pending = True
-            else:
-                self._append("assistant", res.text, res.mode)
+            self.status = ""
 
     @rx.event(background=True)
     async def execute_pending(self):
@@ -173,15 +236,20 @@ class State(rx.State):
             if not self.has_pending or not self.current_id or self.busy:
                 return
             self.busy = True
+            self.status = "Виконую план…"
             root, cid = self.project_root, self.current_id
 
+        client = await asyncio.to_thread(get_client)
         s = sess.load_session(cid)
         plan = s.get_pending_plan()
-        res = await asyncio.to_thread(lambda: runner.execute_plan(plan, root=root))
+        await asyncio.to_thread(lambda: run_plan(
+            plan, client, confirm=lambda st, d: True, root=root,
+            det_handler=lambda step: _det_handler(step, root)))
 
         async with self:
             self.busy = False
-            self._append("assistant", res.text, "edit")
+            self.status = ""
+            self._append("assistant", render_for_planner(plan), "edit")
             s2 = sess.load_session(self.current_id)
             s2.clear_pending_plan()
             sess.save_session(s2)
@@ -342,7 +410,24 @@ def input_box() -> rx.Component:
 def message_bubble(m: dict) -> rx.Component:
     mine = m["role"] == "user"
     return rx.box(
-        rx.text(m["content"], class_name="whitespace-pre-wrap text-gray-100 text-sm"),
+        rx.cond(
+            mine,
+            rx.text(m["content"], class_name="whitespace-pre-wrap text-gray-100 text-sm"),
+            rx.box(
+                rx.cond(
+                    m["thinking"] != "",
+                    rx.el.details(
+                        rx.el.summary("Роздуми моделі",
+                                      class_name="text-xs text-gray-500 cursor-pointer select-none"),
+                        rx.markdown(m["thinking"]),
+                        class_name="mb-2 border-l-2 border-white/10 pl-2",
+                    ),
+                    rx.fragment(),
+                ),
+                rx.markdown(m["content"]),
+                class_name="text-sm",
+            ),
+        ),
         class_name=rx.cond(mine, "self-end bg-white/10", "self-start bg-white/[0.03]")
         + " rounded-2xl px-4 py-2.5 max-w-[85%]",
     )
@@ -357,9 +442,22 @@ def pending_bar() -> rx.Component:
     )
 
 
+def status_line() -> rx.Component:
+    return rx.cond(
+        State.busy,
+        rx.hstack(
+            rx.spinner(size="1"),
+            rx.text(State.status, class_name="text-sm text-gray-400 italic"),
+            class_name="self-start items-center gap-2 px-1",
+        ),
+        rx.fragment(),
+    )
+
+
 def chat_view() -> rx.Component:
     return rx.vstack(
         rx.foreach(State.messages, message_bubble),
+        status_line(),
         rx.cond(State.has_pending, pending_bar(), rx.fragment()),
         class_name="w-full max-w-2xl mx-auto flex-1 overflow-y-auto px-4 py-6 gap-3",
     )

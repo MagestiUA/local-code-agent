@@ -29,7 +29,7 @@ def main() -> None:
     assert "X = 1" not in ctx
 
     cap = CapStub("Парсер повертає 42.")
-    out = answer("що робить parser.py?", ctx, cap)
+    out, _thinking = answer("що робить parser.py?", ctx, cap)
     assert out == "Парсер повертає 42."
     joined = " ".join(m["content"] for m in cap.captured)
     assert "return 42" in joined, "контекст не дійшов до моделі"

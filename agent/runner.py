@@ -28,6 +28,7 @@ class TaskResult:
     mode: str                       # answer | shell | plan | edit
     text: str                       # відповідь / вивід / підсумок плану
     state: TaskState | None = None  # план (для plan/edit)
+    thinking: str = ""              # роздуми моделі (think on)
 
 
 def handle(task: str, root: str | Path = ".", client: OllamaClient | None = None,
@@ -38,7 +39,8 @@ def handle(task: str, root: str | Path = ".", client: OllamaClient | None = None
 
     if mode == "answer":
         ctx = build_context(root, reference_files, task)
-        return TaskResult("answer", answer(task, ctx, client))
+        content, thinking = answer(task, ctx, client)
+        return TaskResult("answer", content, thinking=thinking)
 
     if mode == "shell":
         cmd = extract_command(task, client)

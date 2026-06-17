@@ -54,11 +54,12 @@ def build_context(root: str | Path, reference_files=(), question: str = "",
     return "\n\n".join(parts)
 
 
-def answer(question: str, context: str = "", client: OllamaClient | None = None) -> str:
+def answer(question: str, context: str = "", client: OllamaClient | None = None) -> tuple[str, str]:
+    """Повертає (відповідь, роздуми). Роздуми (think on) — для згортання в UI."""
     client = client or OllamaClient()
     user = (f"Контекст:\n{context}\n\n" if context else "") + f"Питання:\n{question}"
     msg = client.chat(
         [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
         profile=config.PLANNER,
     )
-    return (msg.get("content") or "").strip()
+    return (msg.get("content") or "").strip(), (msg.get("thinking") or "").strip()

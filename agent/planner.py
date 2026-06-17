@@ -52,7 +52,8 @@ SYSTEM = (
     "(protobufs, payloads) are ALWAYS deterministic; never make the model retype them.\n"
     "- 'inline': trivial; no separate executor step needed.\n"
     "Each step is an object {\"kind\":..,\"description\":..,\"target\":..} where target is "
-    "the file path the step touches, or null. Reply ONLY as JSON: {\"steps\":[...]}."
+    "the file path the step touches, or null. Write each 'description' in the SAME "
+    "language as the user's task. Reply ONLY as JSON: {\"steps\":[...]}."
 )
 
 # JSON-schema для format -> жорстка структура відповіді.
