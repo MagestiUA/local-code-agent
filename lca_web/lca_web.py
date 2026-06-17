@@ -5,6 +5,7 @@ G3: керування сесіями через бекенд (agent/session.py)
 Прив'язки runner (answer/shell/plan/edit) — G4.
 """
 import asyncio
+import threading
 from pathlib import Path
 
 import reflex as rx
@@ -56,10 +57,30 @@ class State(rx.State):
     rename_open: bool = False
     rename_id: str = ""
     rename_input: str = ""
+    confirm_open: bool = False
+    confirm_text: str = ""
+    _confirm_event: object = None     # threading.Event — бекенд-поле, не серіалізується
+    _confirm_holder: object = None    # dict {"ok": bool} — результат кліку
 
     @rx.event
     def set_task(self, v: str):
         self.task = v
+
+    @rx.event
+    def confirm_yes(self):
+        if self._confirm_holder is not None:
+            self._confirm_holder["ok"] = True
+        self.confirm_open = False
+        if self._confirm_event is not None:
+            self._confirm_event.set()
+
+    @rx.event
+    def confirm_no(self):
+        if self._confirm_holder is not None:
+            self._confirm_holder["ok"] = False
+        self.confirm_open = False
+        if self._confirm_event is not None:
+            self._confirm_event.set()
 
     @rx.var
     def folder_name(self) -> str:
@@ -201,19 +222,39 @@ class State(rx.State):
         self.references = [x for x in self.references if x != r]
         self._save_current()
 
-    def _exec_ctx(self, root: str, client) -> ToolContext:
-        """ToolContext для виконання плану. edits=auto (план уже схвалено —
-        через plan_first або edits=auto). shell=ask без UI-підтвердження
-        небезпечний у фоні, тож зводимо до allowlist."""
-        shell_perm = "allowlist" if self.shell == "ask" else self.shell
-        return ToolContext(root=Path(root),
-                           permissions={"edits": "auto", "shell": shell_perm},
-                           client=client)
+    def _make_confirm(self, loop):
+        """Збудувати confirm(text)->bool для shell=ask. Викликається із воркер-потоку
+        (asyncio.to_thread), тож показ діалогу планує корутину на головний цикл через
+        run_coroutine_threadsafe, а саме очікування — на threading.Event (блокує лише
+        воркер, не цикл). Закриття без відповіді неможливе (діалог керований кнопками);
+        таймаут 300с -> відмова, щоб воркер не завис назавжди."""
+        def confirm(text: str) -> bool:
+            ev = threading.Event()
+            holder = {"ok": False}
+
+            async def _show():
+                async with self:
+                    self._confirm_event = ev
+                    self._confirm_holder = holder
+                    self.confirm_text = text
+                    self.confirm_open = True
+
+            asyncio.run_coroutine_threadsafe(_show(), loop).result()
+            if not ev.wait(timeout=300):
+                return False
+            return holder["ok"]
+        return confirm
 
     async def _execute_steps(self, plan, root: str, client):
         """Виконати кроки плану через per-step tool-loop: модель сама обирає тули
-        (read/write/edit/run_shell), ми лише показуємо її дії та diff у чаті."""
-        ctx = self._exec_ctx(root, client)
+        (read/write/edit/run_shell), ми лише показуємо її дії та diff у чаті.
+
+        ToolContext: edits=auto (план уже схвалено — через plan_first або edits=auto).
+        shell передаємо як є; для shell=ask confirm показує модальний попап."""
+        loop = asyncio.get_running_loop()
+        ctx = ToolContext(root=Path(root),
+                          permissions={"edits": "auto", "shell": self.shell},
+                          client=client, confirm=self._make_confirm(loop))
         for step in plan.steps:
             async with self:
                 self.status = f"Крок #{step.id}: {step.description[:50]}"
@@ -383,6 +424,25 @@ def rename_dialog() -> rx.Component:
         ),
         open=State.rename_open,
         on_open_change=State.set_rename_open,
+    )
+
+
+def confirm_dialog() -> rx.Component:
+    """Попап для shell=ask: підтвердити запуск команди. Керований лише кнопками
+    (без on_open_change), щоб закриття не лишило воркер у вічному очікуванні."""
+    return rx.dialog.root(
+        rx.dialog.content(
+            rx.dialog.title("Виконати команду в консолі?"),
+            rx.code_block(State.confirm_text, language="powershell",
+                          class_name="w-full mt-2"),
+            rx.flex(
+                rx.button("Відхилити", variant="soft", color_scheme="red",
+                          on_click=State.confirm_no),
+                rx.button("Виконати", on_click=State.confirm_yes),
+                spacing="2", justify="end", class_name="mt-3",
+            ),
+        ),
+        open=State.confirm_open,
     )
 
 
@@ -606,6 +666,7 @@ def index() -> rx.Component:
         sidebar(),
         main_area(),
         rename_dialog(),
+        confirm_dialog(),
         class_name="h-screen w-screen overflow-hidden",
         style={"backgroundColor": BG},
         spacing="0",
