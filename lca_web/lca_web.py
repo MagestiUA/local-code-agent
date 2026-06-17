@@ -5,19 +5,19 @@ G3: керування сесіями через бекенд (agent/session.py)
 Прив'язки runner (answer/shell/plan/edit) — G4.
 """
 import asyncio
-import re
 from pathlib import Path
 
 import reflex as rx
 
 from agent import session as sess
+from agent.agent_loop import run_step
 from agent.answerer import answer, build_context
-from agent.executor import apply_edit, create_from_source, run_edit
 from agent.intent import classify_intent, extract_command
 from agent.llm import OllamaClient
 from agent.memory import render_for_planner
 from agent.planner import make_plan
 from agent.project import load_project_doc
+from agent.toolkit import ToolContext
 from agent.tools import run_shell
 
 _CLIENT = None
@@ -28,22 +28,6 @@ def get_client() -> OllamaClient:
     if _CLIENT is None:
         _CLIENT = OllamaClient()
     return _CLIENT
-
-
-def _det_handler(step, root: str) -> str:
-    """Обробник deterministic-кроків: запуск тестів -> pytest, решта -> примітка.
-    Перевіряємо дієслово запуску + слово 'тест', щоб не ловити 'test' у назві файлу."""
-    d = step.description.lower()
-    is_run_tests = "pytest" in d or (
-        ("прогн" in d or "запуст" in d or "run" in d) and ("тест" in d or "test" in d))
-    if is_run_tests:
-        r = run_shell("pytest -q", cwd=root)
-        if not r.allowed:
-            return "pytest заблоковано allow-list"
-        if r.returncode == -1:
-            return "тести пропущено (pytest недоступний)"
-        return f"pytest завершився з кодом {r.returncode}"
-    return "крок не автоматизовано (файлові операції зробить llm-крок)"
 
 
 BG = "#262624"
@@ -217,69 +201,43 @@ class State(rx.State):
         self.references = [x for x in self.references if x != r]
         self._save_current()
 
-    def _find_source(self, root: str, task: str, step) -> Path | None:
-        """Знайти файл-джерело для створення нового: згаданий у задачі/кроці
-        наявний .py (крім самого target), інакше — перший reference-файл."""
-        target_name = Path(step.target).name if step.target else ""
-        for n in re.findall(r"[\w.\-]+\.py", (task or "") + " " + (step.description or "")):
-            nm = Path(n).name
-            if nm == target_name:
-                continue
-            p = Path(root) / nm
-            if p.exists():
-                return p
-        for rf in self.references:
-            if str(rf).endswith(".py") and Path(rf).exists():
-                return Path(rf)
-        return None
+    def _exec_ctx(self, root: str, client) -> ToolContext:
+        """ToolContext для виконання плану. edits=auto (план уже схвалено —
+        через plan_first або edits=auto). shell=ask без UI-підтвердження
+        небезпечний у фоні, тож зводимо до allowlist."""
+        shell_perm = "allowlist" if self.shell == "ask" else self.shell
+        return ToolContext(root=Path(root),
+                           permissions={"edits": "auto", "shell": shell_perm},
+                           client=client)
 
     async def _execute_steps(self, plan, root: str, client):
-        """Виконати кроки плану, показуючи diff/результат кожного в чаті."""
+        """Виконати кроки плану через per-step tool-loop: модель сама обирає тули
+        (read/write/edit/run_shell), ми лише показуємо її дії та diff у чаті."""
+        ctx = self._exec_ctx(root, client)
         for step in plan.steps:
             async with self:
                 self.status = f"Крок #{step.id}: {step.description[:50]}"
             if step.kind == "inline":
                 plan.set_result(step.id, "done", "inline")
                 continue
-            if step.kind == "deterministic":
-                msg = await asyncio.to_thread(lambda s=step: _det_handler(s, root))
-                plan.set_result(step.id, "done", msg)
-                async with self:
-                    self._append("assistant", f"Крок #{step.id} (deterministic): {msg}", "note")
-                continue
-            # llm
-            if not step.target:
-                plan.set_result(step.id, "failed", "немає файлу")
-                async with self:
-                    self._append("assistant", f"Крок #{step.id}: пропущено (немає цільового файлу).", "note")
-                continue
-            target = Path(root) / step.target
-            if target.exists():
-                res = await asyncio.to_thread(
-                    lambda t=target, s=step: run_edit(t, s.description, client, False))
-            else:
-                src = self._find_source(root, plan.task, step)
-                if not src:
-                    plan.set_result(step.id, "failed", "нема джерела")
-                    async with self:
-                        self._append("assistant",
-                                     f"Крок #{step.id}: не знайдено джерело для створення {step.target}.",
-                                     "note")
-                    continue
-                async with self:
-                    self.status = f"Створюю {step.target} з {Path(src).name}…"
-                res = await asyncio.to_thread(
-                    lambda t=target, s=step, sr=src: create_from_source(t, sr, s.description, client))
-            if not res.ok:
-                plan.set_result(step.id, "failed", res.error)
-                async with self:
-                    self._append("assistant", f"Крок #{step.id}: помилка — {res.error}", "note")
-                continue
-            await asyncio.to_thread(lambda t=target, r=res: apply_edit(t, r))
-            plan.set_result(step.id, "done", f"+{res.diff.count(chr(10))} рядків")
+
+            actions: list[tuple[str, str]] = []   # (tool_name, result) — заповнює on_tool у потоці
+            final, log = await asyncio.to_thread(
+                lambda s=step, c=ctx: run_step(
+                    s.description, c, client,
+                    on_tool=lambda n, a, r: actions.append((n, r))))
+
+            plan.set_result(step.id, "done" if log else "failed", final or "—")
             async with self:
-                self._append("assistant",
-                             f"**{step.target}**\n```diff\n{res.diff}\n```", "diff")
+                for name, result in actions:
+                    if name in ("edit_file", "create_from_source"):
+                        self._append("assistant", f"**{step.description[:60]}**\n```diff\n{result}\n```", "diff")
+                    elif name == "run_shell":
+                        self._append("assistant", f"```\n{result}\n```", "shell")
+                    else:
+                        self._append("assistant", f"`{name}` → {result[:200]}", "note")
+                if final:
+                    self._append("assistant", f"Крок #{step.id}: {final}", "note")
         async with self:
             self._append("assistant", "Готово ✓", "note")
 
