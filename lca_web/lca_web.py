@@ -80,6 +80,7 @@ class State(rx.State):
     task: str = ""
     messages: list[dict] = []
     has_pending: bool = False
+    queued_text: str = ""                  # повідомлення, що чекає, поки модель зайнята
     context_summary: str = ""              # контекст-памʼять розмови (підсумок)
     # планувальник-діалог (#2+#5): питання/вибір, що очікує відповіді
     has_question: bool = False
@@ -167,6 +168,7 @@ class State(rx.State):
         self.messages = []
         self.references = []
         self.has_pending = False
+        self.queued_text = ""
         self.context_summary = ""
         self._load_question(None)
 
@@ -362,7 +364,7 @@ class State(rx.State):
             plan.set_result(step.id, "done" if log else "failed", final or "—")
         async with self:
             self._append("assistant", "Готово ✓", "note")
-        await self._update_summary(plan.task, render_for_planner(plan), client)
+        return render_for_planner(plan)               # outcome для фонового підсумку
 
     def _exec_ctx(self, root: str, client) -> ToolContext:
         """ToolContext для виконання: edits=auto (план/запит уже схвалено),
@@ -488,43 +490,75 @@ class State(rx.State):
                     self._append("assistant", f"🔎 {query}", "step", thinking=result)
         return body
 
-    async def _update_summary(self, user_text: str, outcome: str, client):
-        """Оновити контекст-памʼять розмови (LLM-підсумок) після завершеного запиту."""
+    async def _update_summary(self, user_text: str, outcome: str):
+        """Оновлення контекст-памʼяті (LLM-підсумок) після завершеного запиту. Модель
+        однопотокова, тож це триває в межах busy; нові повідомлення стають у чергу
+        (queued_text) і виконаються після — вже зі свіжим стисненим контекстом.
+        cid-гард: якщо користувач перемкнув чат, пишемо в сесію-походження."""
         if not (outcome or "").strip():
             return
+        client = await asyncio.to_thread(get_client)
         async with self:
             cur = self.context_summary
-            self.status = "Оновлюю контекст…"
+            cid = self.current_id
         new = await asyncio.to_thread(
             lambda: convo.update_summary(cur, user_text, outcome, client))
         async with self:
-            self.context_summary = new
-            if self.current_id:
-                s = sess.load_session(self.current_id)
+            if self.current_id == cid:                # та сама сесія — оновити й у State
+                self.context_summary = new
+            if cid:                                   # у файл — завжди в сесію-походження
+                s = sess.load_session(cid)
                 s.context_summary = new
                 sess.save_session(s)
 
     @rx.event(background=True)
     async def send_task(self, form_data: dict | None = None):
+        """Надсилання. Модель однопотокова: якщо зайнята (busy) — повідомлення стає в
+        чергу (додається до наявного) і виконається після з уже свіжим контекстом."""
         async with self:
             if not self.current_id:
                 return
-            chat_mode = self.mode == "chat"
-            if not chat_mode and not self.project_root:
+            if self.mode != "chat" and not self.project_root:
                 self._append("assistant", "Спершу вкажіть робочу теку.", "note")
                 return
             text = self.task.strip()
-            if not text or self.busy:
+            if not text:
                 return
             self.task = ""
             self._append("user", text)
+            if self.busy:                              # модель зайнята -> у чергу
+                self.queued_text = (self.queued_text + "\n\n" + text).strip() if self.queued_text else text
+                return
             self.busy = True
+        await self._process_one(text)
+        await self._drain_and_unbusy()
+
+    async def _drain_and_unbusy(self):
+        """Після завершення запиту: якщо в черзі є повідомлення — виконати його (busy
+        тримається), інакше зняти busy. Перевірка + зняття — атомарні, без втрати черги."""
+        while True:
+            async with self:
+                if self.queued_text:
+                    nxt = self.queued_text
+                    self.queued_text = ""
+                    self.status = "Обробка запиту з черги…"
+                else:
+                    self.busy = False
+                    self.status = ""
+                    return
+            await self._process_one(nxt)
+
+    async def _process_one(self, text: str):
+        """Обробити ОДНЕ повідомлення (user-бульбашку вже додано). Включає фінальний
+        LLM-підсумок контексту. busy не чіпає — ним керує send_task/_drain_and_unbusy."""
+        async with self:
             self._reset_tokens()
+            chat_mode = self.mode == "chat"
             root = self.project_root
             refs = [str(x) for x in self.references]
             plan_first = self.plan_first or self.edits == "ask"
-            summary = self.context_summary         # контекст-памʼять для цього запиту
-            answering = self.has_question          # вписана відповідь на питання планувальника
+            summary = self.context_summary
+            answering = self.has_question
             if answering:
                 self.has_question = False
                 self.status = "Обмірковую відповідь…"
@@ -532,37 +566,37 @@ class State(rx.State):
                 self.status = "Думаю…" if chat_mode else "Визначаю тип запиту…"
 
         client = await asyncio.to_thread(get_client)
+        su, so = text, ""
 
         if chat_mode:
-            await self._chat_reply(text, client)
+            so = await self._chat_reply(text, client)
         elif answering:
-            await self._resume_planning(text, root, plan_first, client)
+            su, so = await self._resume_planning(text, root, plan_first, client)
         else:
             mode = await asyncio.to_thread(lambda: classify_intent(text, client))
             if mode == "answer":
                 async with self:
                     self.status = "Аналізую код…"
                 ctx = await asyncio.to_thread(lambda: build_context(root, refs, text))
-                ctx = convo.as_context(summary) + ctx
-                body = await self._stream_answer(text, ctx, client)
-                await self._update_summary(text, body, client)
+                so = await self._stream_answer(text, convo.as_context(summary) + ctx, client)
             elif mode == "shell":
                 async with self:
                     self.status = "Виконую запит…"
                 ctx = self._exec_ctx(root, client)
                 final, _ = await self._run_tool_step(text, ctx, context=convo.as_context(summary))
-                await self._update_summary(text, final or "виконано дії інструментами", client)
+                so = final or "виконано дії інструментами"
             else:  # plan / edit -> планувальник-діалог
                 async with self:
                     self.status = "Обмірковую план…"
                 doc = await asyncio.to_thread(lambda: load_project_doc(root))
                 struct = await asyncio.to_thread(lambda: scan_structure(root))
-                context = convo.as_context(summary) + struct
-                await self._deliberate_flow(text, context, doc, [], root, plan_first, client)
+                su, so = await self._deliberate_flow(
+                    text, convo.as_context(summary) + struct, doc, [], root, plan_first, client)
 
-        async with self:
-            self.busy = False
-            self.status = ""
+        if (so or "").strip():
+            async with self:
+                self.status = "Оновлюю памʼять…"
+            await self._update_summary(su, so)
 
     @rx.event(background=True)
     async def answer_planner(self, value: str):
@@ -578,26 +612,29 @@ class State(rx.State):
             root = self.project_root
             plan_first = self.plan_first or self.edits == "ask"
         client = await asyncio.to_thread(get_client)
-        await self._resume_planning(value, root, plan_first, client)
-        async with self:
-            self.busy = False
-            self.status = ""
+        task, outcome = await self._resume_planning(value, root, plan_first, client)
+        if (outcome or "").strip():
+            async with self:
+                self.status = "Оновлюю памʼять…"
+            await self._update_summary(task, outcome)
+        await self._drain_and_unbusy()
 
     async def _resume_planning(self, value: str, root: str, plan_first: bool, client):
         """Продовжити планування після відповіді користувача: додати її в history,
-        повторити deliberate."""
+        повторити deliberate. Повертає (task, outcome)."""
         async with self:
             s = sess.load_session(self.current_id)
             q = s.pending_question or {}
         history = list(q.get("history") or []) + [{"question": q.get("question", ""), "answer": value}]
         task = q.get("task", value)
-        await self._deliberate_flow(task, q.get("context", ""), q.get("doc"),
-                                    history, root, plan_first, client)
+        return await self._deliberate_flow(task, q.get("context", ""), q.get("doc"),
+                                           history, root, plan_first, client)
 
     async def _deliberate_flow(self, task: str, context: str, doc, history: list,
                                root: str, plan_first: bool, client):
         """Один хід планувальника-діалогу: clarify/choose -> питання+кнопки (пауза);
-        plan -> готовий план (виконати або показати на підтвердження)."""
+        plan -> готовий план (виконати або показати на підтвердження).
+        Повертає (task, outcome) — outcome='' якщо пауза/не виконано (підсумок не потрібен)."""
         result = await asyncio.to_thread(
             lambda: deliberate(task, context, client, doc, history))
         action = result["action"]
@@ -617,7 +654,7 @@ class State(rx.State):
                 s.set_pending_question(q)
                 s.clear_pending_plan()
                 sess.save_session(s)
-            return
+            return task, ""
 
         # action == "plan"
         state = result["state"]
@@ -629,7 +666,7 @@ class State(rx.State):
         if not state or not state.steps:
             async with self:
                 self._append("assistant", "Не вдалося скласти план.", "note")
-            return
+            return task, ""
         if plan_first:
             async with self:
                 self._append("assistant", render_for_planner(state), "plan")
@@ -637,8 +674,9 @@ class State(rx.State):
                 s.set_pending_plan(state)
                 sess.save_session(s)
                 self.has_pending = True
-        else:
-            await self._execute_steps(state, root, client)
+            return task, ""                           # виконається пізніше -> підсумок там
+        outcome = await self._execute_steps(state, root, client)
+        return task, outcome
 
     @rx.event(background=True)
     async def execute_pending(self):
@@ -652,15 +690,18 @@ class State(rx.State):
         client = await asyncio.to_thread(get_client)
         s = sess.load_session(cid)
         plan = s.get_pending_plan()
-        await self._execute_steps(plan, root, client)
+        outcome = await self._execute_steps(plan, root, client)
 
         async with self:
-            self.busy = False
-            self.status = ""
             s2 = sess.load_session(self.current_id)
             s2.clear_pending_plan()
             sess.save_session(s2)
             self.has_pending = False
+        if (outcome or "").strip():
+            async with self:
+                self.status = "Оновлюю памʼять…"
+            await self._update_summary(plan.task, outcome)
+        await self._drain_and_unbusy()
 
     @rx.event
     def discard_pending(self):
@@ -875,9 +916,9 @@ def controls_bar() -> rx.Component:
                 class_name="items-center gap-2",
             ),
         ),
-        rx.button(
-            rx.cond(State.busy, rx.spinner(size="1"), rx.icon("arrow-up", size=16)),
-            type="submit", disabled=State.busy,
+        rx.button(                                    # доступна й коли busy — щоб стати в чергу
+            rx.cond(State.busy, rx.icon("plus", size=16), rx.icon("arrow-up", size=16)),
+            type="submit",
             size="1", radius="full", class_name="bg-white text-black ml-1"),
         class_name="w-full items-center mt-2 gap-2",
     )
@@ -902,12 +943,19 @@ def references_row() -> rx.Component:
 
 
 def token_bar() -> rx.Component:
-    """Лічильник токенів поточного запиту — над полем вводу. Спінер поки busy."""
+    """Лічильник токенів поточного запиту + індикатор черги — над полем вводу."""
     return rx.cond(
         (State.tok_out > 0) | State.busy,
         rx.hstack(
             rx.cond(State.busy, rx.spinner(size="1"), rx.fragment()),
             rx.text(State.tokens_label, class_name="text-xs text-gray-500 font-mono"),
+            rx.cond(
+                State.queued_text != "",
+                rx.hstack(rx.icon("clock", size=12, class_name="text-amber-400"),
+                          rx.text("у черзі", class_name="text-xs text-amber-400"),
+                          class_name="items-center gap-1"),
+                rx.fragment(),
+            ),
             class_name="items-center gap-2 self-start px-1 mb-1",
         ),
         rx.box(class_name="h-0"),
