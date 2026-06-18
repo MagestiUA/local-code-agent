@@ -30,7 +30,7 @@ ALLOWED_SHELL = (
     # інші мови / пакетні менеджери
     "npm", "node", "npx",
     "cargo", "rustc",
-    "go ",
+    "go",
 )
 SHELL_TIMEOUT = 120
 

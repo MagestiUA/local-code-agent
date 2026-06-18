@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import reflex as rx
+from reflex.components.radix.themes.color_mode import set_color_mode
 
 from agent import config
 from agent import convo
@@ -160,6 +161,17 @@ class State(rx.State):
         return f"↑{ctx} ctx · ↓{self.tok_out} out · {self.tok_tps} tok/s"
 
     @rx.var
+    def ui_font_js(self) -> str:
+        """JS, що масштабує кореневий шрифт <html> — усі rem-based Tailwind-розміри
+        (text-xs/sm/4xl) інтерфейсу скейляться пропорційно. Чат має власний px-розмір."""
+        return f"document.documentElement.style.fontSize='{self.font_ui}px'"
+
+    @rx.var
+    def chat_font_px(self) -> str:
+        """Розмір шрифту повідомлень чату в px (абсолютний, не залежить від font_ui)."""
+        return f"{self.font_chat}px"
+
+    @rx.var
     def folder_name(self) -> str:
         return Path(self.project_root).name if self.project_root else "тека"
 
@@ -175,6 +187,11 @@ class State(rx.State):
     def visible_sessions(self) -> list[dict]:
         """Чати поточного режиму (Чат/Код роздільні списки)."""
         return [s for s in self.sessions if s.get("kind", "code") == self.mode]
+
+    def _clear_attachments(self):
+        """Скинути вкладення поточного запиту: chips зі State + вміст із модуль-дикту."""
+        _ATTACHMENT_CONTENT.pop(self.current_id, None)
+        self.attachments = []
 
     def _clear_view(self):
         _ATTACHMENT_CONTENT.pop(self.current_id, None)
@@ -333,6 +350,8 @@ class State(rx.State):
         self.theme = d["theme"]
         self.font_chat = d["font_chat"]
         self.font_ui = d["font_ui"]
+        # застосувати збережену тему + масштаб шрифту інтерфейсу на старті
+        return [set_color_mode(self.theme), rx.call_script(self.ui_font_js)]
 
     def _save_settings(self):
         from agent import settings as S
@@ -342,6 +361,7 @@ class State(rx.State):
     def set_theme(self, v: str):
         self.theme = v
         self._save_settings()
+        return set_color_mode(v)                    # реально перемкнути світлу/темну/авто
 
     @rx.event
     def set_font_chat(self, v: int):
@@ -352,6 +372,7 @@ class State(rx.State):
     def set_font_ui(self, v: int):
         self.font_ui = max(11, min(16, int(v)))
         self._save_settings()
+        return rx.call_script(self.ui_font_js)     # застосувати масштаб інтерфейсу негайно
 
     # ── Вкладення (#10) ────────────────────────────────────────────────────────
     @rx.event
@@ -432,7 +453,12 @@ class State(rx.State):
             att_meta = list(self.attachments)
             cid = self.current_id
         att_bucket = _ATTACHMENT_CONTENT.get(cid, {})
+        stop_ev = _STOP_EVENTS.get(cid)
+        stopped = False
         for step in plan.steps:
+            if stop_ev is not None and stop_ev.is_set():       # перервано між кроками
+                stopped = True
+                break
             async with self:
                 self.status = f"Крок #{step.id}: {step.description[:50]}"
             if step.kind == "inline":
@@ -449,10 +475,11 @@ class State(rx.State):
                                                  meta.get("truncated", False))
             final, log = await self._run_tool_step(step.description, ctx,
                                                    title=step.description[:60],
-                                                   context=step_ctx)
+                                                   context=step_ctx, stop_event=stop_ev)
             plan.set_result(step.id, "done" if log else "failed", final or "—")
         async with self:
-            self._append("assistant", "Готово ✓", "note")
+            self._append("assistant", "⛔ Зупинено" if stopped else "Готово ✓", "note")
+            self._clear_attachments()                  # вкладення спожиті/скинуті
         return render_for_planner(plan)               # outcome для фонового підсумку
 
     def _exec_ctx(self, root: str, client) -> ToolContext:
@@ -464,7 +491,7 @@ class State(rx.State):
                            confirm=self._make_confirm(asyncio.get_running_loop()))
 
     async def _run_tool_step(self, step_text: str, ctx: ToolContext, title: str = "",
-                             context: str = ""):
+                             context: str = "", stop_event=None):
         """Один прохід tool-loop. У чат додає ОДНЕ повідомлення на крок: видимий
         заголовок + короткий підсумок, а всі дії моделі (списки файлів, diff-и,
         вивід команд) ховає під кат «хід виконання» (kind=step). Повертає (final, log)."""
@@ -472,7 +499,8 @@ class State(rx.State):
         stats: list[dict] = []                # client.last_stats кожного виклику моделі
         final, log = await asyncio.to_thread(
             lambda: run_step(step_text, ctx, ctx.client, context=context, stats_sink=stats,
-                             on_tool=lambda n, a, r: actions.append((n, r))))
+                             on_tool=lambda n, a, r: actions.append((n, r)),
+                             stop_event=stop_event))
 
         parts: list[str] = []
         for name, result in actions:
@@ -633,6 +661,8 @@ class State(rx.State):
                 sess.save_session(s)
                 self.sessions = sess.list_sessions()
                 self._select(s.id)
+                if "_tmp" in _ATTACHMENT_CONTENT:       # перенести пре-сесійні вкладення
+                    _ATTACHMENT_CONTENT[s.id] = _ATTACHMENT_CONTENT.pop("_tmp")
             if self.mode != "chat" and not self.project_root:
                 self._append("assistant", "Спершу вкажіть робочу теку.", "note")
                 return
@@ -660,6 +690,8 @@ class State(rx.State):
                 else:
                     self.busy = False
                     self.status = ""
+                    self.stopping = False                 # скидаємо стоп-стан на всіх шляхах
+                    _STOP_EVENTS.pop(self.current_id, None)
                     return
             await self._process_one(nxt)
 
@@ -668,15 +700,15 @@ class State(rx.State):
         LLM-підсумок контексту. busy не чіпає — ним керує send_task/_drain_and_unbusy."""
         async with self:
             self._reset_tokens()
+            # Свіжа стоп-подія на кожен запит, щоб stop_generation і виконавець кроків
+            # завжди працювали з одним і тим самим обʼєктом (а не None, захопленим зарано).
+            _STOP_EVENTS[self.current_id] = threading.Event()
             chat_mode = self.mode == "chat"
             root = self.project_root
             refs = [str(x) for x in self.references]
             plan_first = self.plan_first or self.edits == "ask"
             summary = self.context_summary
             answering = self.has_question
-            # Знімаємо вкладення зі стану (вміст лишається у _ATTACHMENT_CONTENT
-            # поки крок виконавця не забере — потім _clear_view або новий send чистить)
-            self.attachments = []
             if answering:
                 self.has_question = False
                 self.status = "Обмірковую відповідь…"
@@ -702,7 +734,8 @@ class State(rx.State):
                     self.status = "Виконую запит…"
                 ctx = self._exec_ctx(root, client)
                 shell_ctx = f"Project root: {root}\n{convo.as_context(summary)}" if summary else f"Project root: {root}"
-                final, _ = await self._run_tool_step(text, ctx, context=shell_ctx)
+                final, _ = await self._run_tool_step(text, ctx, context=shell_ctx,
+                                                     stop_event=_STOP_EVENTS.get(self.current_id))
                 so = final or "виконано дії інструментами"
             else:  # plan / edit -> планувальник-діалог
                 async with self:
@@ -716,6 +749,10 @@ class State(rx.State):
             async with self:
                 self.status = "Оновлюю памʼять…"
             await self._update_summary(su, so)
+        # Вкладення спожиті — чистимо, якщо запит не на паузі (план/уточнення триває)
+        async with self:
+            if not (self.has_pending or self.has_question):
+                self._clear_attachments()
 
     @rx.event(background=True)
     async def answer_planner(self, value: str):
@@ -725,6 +762,7 @@ class State(rx.State):
                 return
             self.busy = True
             self._reset_tokens()
+            _STOP_EVENTS[self.current_id] = threading.Event()   # свіжа стоп-подія на запит
             self._append("user", value)
             self.has_question = False
             self.status = "Обмірковую відповідь…"
@@ -809,6 +847,7 @@ class State(rx.State):
                 return
             self.busy = True
             self.status = "Виконую план…"
+            _STOP_EVENTS[self.current_id] = threading.Event()   # свіжа стоп-подія на запит
             root, cid = self.project_root, self.current_id
 
         client = await asyncio.to_thread(get_client)
@@ -1235,7 +1274,8 @@ def message_bubble(m: dict) -> rx.Component:
     return rx.box(
         rx.cond(
             mine,
-            rx.text(m["content"], class_name="whitespace-pre-wrap text-gray-100 text-sm"),
+            rx.text(m["content"], class_name="whitespace-pre-wrap text-gray-100",
+                    style={"fontSize": State.chat_font_px}),
             rx.box(
                 rx.cond(
                     m["thinking"] != "",
@@ -1249,7 +1289,7 @@ def message_bubble(m: dict) -> rx.Component:
                     rx.fragment(),
                 ),
                 rx.markdown(m["content"]),
-                class_name="text-sm",
+                style={"fontSize": State.chat_font_px},
             ),
         ),
         class_name=rx.cond(mine, "self-end bg-white/10", "self-start bg-white/[0.03]")
@@ -1339,7 +1379,7 @@ def chat_view() -> rx.Component:
         id="chat-scroll",
         on_mount=rx.call_script(SCROLL_SETUP_JS),
         class_name="w-full max-w-2xl mx-auto flex-1 overflow-y-auto px-4 py-6 gap-3",
-        style={"fontSize": State.font_chat},
+        style={"fontSize": State.chat_font_px},
     )
 
 

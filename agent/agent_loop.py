@@ -48,7 +48,7 @@ _ESTIMATE_SYSTEM = (
 
 
 def _estimate_iters(step_text: str, context: str, client: OllamaClient) -> int:
-    """Спитати модель скільки тул-викликів потрібно для кроку → повернути n*2 (мін 4)."""
+    """Спитати модель скільки тул-викликів потрібно для кроку → повернути n*2 (мін 6)."""
     user = (f"Context:\n{context}\n\n" if context else "") + f"Step:\n{step_text}"
     try:
         msg = client.chat(
@@ -74,12 +74,15 @@ def _args(call: dict) -> dict:
 
 def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = None,
              registry: ToolRegistry | None = None, context: str = "",
-             max_iters: int | None = None, on_tool=None, stats_sink: list | None = None) -> tuple[str, list[str]]:
+             max_iters: int | None = None, on_tool=None, stats_sink: list | None = None,
+             stop_event=None) -> tuple[str, list[str]]:
     """Виконати один крок через tool-loop.
     max_iters=None → авто-оцінка моделлю (n*2); явне число скасовує оцінку.
     on_tool(name, args, result) — необовʼязковий колбек для UI-журналу.
     stats_sink — якщо передано, у нього додаються client.last_stats кожного виклику
     моделі (для лічильника токенів кроку).
+    stop_event: threading.Event — якщо встановлено, цикл переривається між
+    ітераціями (поточний частковий результат повертається).
     Повертає (фінальний_текст, журнал_дій)."""
     client = client or OllamaClient()
     registry = registry or default_registry()
@@ -91,6 +94,8 @@ def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = Non
     log: list[str] = []
 
     for _ in range(max_iters):
+        if stop_event is not None and stop_event.is_set():
+            return "зупинено користувачем", log
         msg = client.chat(messages, tools=registry.schema(), profile=config.EXECUTOR)
         if stats_sink is not None and client.last_stats:
             stats_sink.append(dict(client.last_stats))
