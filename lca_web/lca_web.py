@@ -23,12 +23,25 @@ from agent.toolkit import ToolContext
 
 _CLIENT = None
 
+# Очікувані confirm-и shell=ask, поза State (threading.Event непіклиться -> інакше
+# StateSerializationError). Ключ — id сесії. {sid: {"event": Event, "ok": bool}}
+_CONFIRMS: dict = {}
+
 
 def get_client() -> OllamaClient:
     global _CLIENT
     if _CLIENT is None:
         _CLIENT = OllamaClient()
     return _CLIENT
+
+
+def _fmt_tokens(stats: list[dict]) -> str:
+    """Рядок-футер лічильника з агрегату stats (сума по викликах моделі кроку)."""
+    prompt = sum(s.get("prompt", 0) for s in stats)
+    out = sum(s.get("out", 0) for s in stats)
+    ns = sum(s.get("eval_ns", 0) for s in stats)
+    tps = round(out / (ns / 1e9), 1) if ns else 0.0
+    return f"`↑{prompt} ctx · ↓{out} out · {tps} tok/s`"
 
 
 BG = "#262624"
@@ -59,8 +72,6 @@ class State(rx.State):
     rename_input: str = ""
     confirm_open: bool = False
     confirm_text: str = ""
-    _confirm_event: object = None     # threading.Event — бекенд-поле, не серіалізується
-    _confirm_holder: object = None    # dict {"ok": bool} — результат кліку
     # живий стрім (#1): оновлюється по ходу роздумів/відповіді
     streaming: bool = False
     stream_content: str = ""
@@ -73,21 +84,20 @@ class State(rx.State):
     def set_task(self, v: str):
         self.task = v
 
+    def _resolve_confirm(self, ok: bool):
+        c = _CONFIRMS.get(self.current_id)
+        if c is not None:
+            c["ok"] = ok
+            c["event"].set()
+        self.confirm_open = False
+
     @rx.event
     def confirm_yes(self):
-        if self._confirm_holder is not None:
-            self._confirm_holder["ok"] = True
-        self.confirm_open = False
-        if self._confirm_event is not None:
-            self._confirm_event.set()
+        self._resolve_confirm(True)
 
     @rx.event
     def confirm_no(self):
-        if self._confirm_holder is not None:
-            self._confirm_holder["ok"] = False
-        self.confirm_open = False
-        if self._confirm_event is not None:
-            self._confirm_event.set()
+        self._resolve_confirm(False)
 
     @rx.var
     def folder_name(self) -> str:
@@ -233,23 +243,23 @@ class State(rx.State):
         """Збудувати confirm(text)->bool для shell=ask. Викликається із воркер-потоку
         (asyncio.to_thread), тож показ діалогу планує корутину на головний цикл через
         run_coroutine_threadsafe, а саме очікування — на threading.Event (блокує лише
-        воркер, не цикл). Закриття без відповіді неможливе (діалог керований кнопками);
+        воркер, не цикл). Event тримаємо в модульному _CONFIRMS (поза State — інакше
+        непіклиться). Закриття без відповіді неможливе (діалог керований кнопками);
         таймаут 300с -> відмова, щоб воркер не завис назавжди."""
+        cid = self.current_id
+
         def confirm(text: str) -> bool:
             ev = threading.Event()
-            holder = {"ok": False}
+            _CONFIRMS[cid] = {"event": ev, "ok": False}
 
             async def _show():
                 async with self:
-                    self._confirm_event = ev
-                    self._confirm_holder = holder
                     self.confirm_text = text
                     self.confirm_open = True
 
             asyncio.run_coroutine_threadsafe(_show(), loop).result()
-            if not ev.wait(timeout=300):
-                return False
-            return holder["ok"]
+            ev.wait(timeout=300)
+            return _CONFIRMS.pop(cid, {}).get("ok", False)
         return confirm
 
     async def _execute_steps(self, plan, root: str, client):
@@ -283,8 +293,9 @@ class State(rx.State):
         заголовок + короткий підсумок, а всі дії моделі (списки файлів, diff-и,
         вивід команд) ховає під кат «хід виконання» (kind=step). Повертає (final, log)."""
         actions: list[tuple[str, str]] = []   # (tool, result) — заповнює on_tool у потоці
+        stats: list[dict] = []                # client.last_stats кожного виклику моделі
         final, log = await asyncio.to_thread(
-            lambda: run_step(step_text, ctx, ctx.client,
+            lambda: run_step(step_text, ctx, ctx.client, stats_sink=stats,
                              on_tool=lambda n, a, r: actions.append((n, r))))
 
         parts: list[str] = []
@@ -301,6 +312,7 @@ class State(rx.State):
         content = f"**{head}**"
         if final:
             content += f"\n\n{final}"
+        content += "\n\n" + _fmt_tokens(stats)
         async with self:
             self._append("assistant", content, "step", thinking=log_md)
         return final, log

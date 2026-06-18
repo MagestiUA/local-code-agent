@@ -40,9 +40,11 @@ def _args(call: dict) -> dict:
 
 def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = None,
              registry: ToolRegistry | None = None, context: str = "",
-             max_iters: int = 5, on_tool=None) -> tuple[str, list[str]]:
+             max_iters: int = 5, on_tool=None, stats_sink: list | None = None) -> tuple[str, list[str]]:
     """Виконати один крок через tool-loop.
     on_tool(name, args, result) — необовʼязковий колбек для UI-журналу.
+    stats_sink — якщо передано, у нього додаються client.last_stats кожного виклику
+    моделі (для лічильника токенів кроку).
     Повертає (фінальний_текст, журнал_дій)."""
     client = client or OllamaClient()
     registry = registry or default_registry()
@@ -53,6 +55,8 @@ def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = Non
 
     for _ in range(max_iters):
         msg = client.chat(messages, tools=registry.schema(), profile=config.EXECUTOR)
+        if stats_sink is not None and client.last_stats:
+            stats_sink.append(dict(client.last_stats))
         calls = msg.get("tool_calls") or []
         if not calls:
             return (msg.get("content") or "").strip(), log
