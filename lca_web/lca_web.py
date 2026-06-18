@@ -34,6 +34,9 @@ _CLIENT = None
 # StateSerializationError). Ключ — id сесії. {sid: {"event": Event, "ok": bool}}
 _CONFIRMS: dict = {}
 
+# Stop-події для переривання стріму/виконання. Ключ — id сесії.
+_STOP_EVENTS: dict = {}
+
 
 def get_client() -> OllamaClient:
     global _CLIENT
@@ -72,7 +75,7 @@ class State(rx.State):
     title: str = ""
     project_root: str = ""
     edits: str = "ask"
-    shell: str = "allowlist"
+    shell: str = "smart"
     plan_first: bool = False
     references: list[str] = []
     folder_input: str = ""
@@ -81,7 +84,13 @@ class State(rx.State):
     messages: list[dict] = []
     has_pending: bool = False
     queued_text: str = ""                  # повідомлення, що чекає, поки модель зайнята
+    stopping: bool = False                 # стоп запитано, чекаємо переривання
     context_summary: str = ""              # контекст-памʼять розмови (підсумок)
+    # Налаштування (#9)
+    settings_open: bool = False
+    theme: str = "dark"
+    font_chat: int = 14
+    font_ui: int = 13
     # планувальник-діалог (#2+#5): питання/вибір, що очікує відповіді
     has_question: bool = False
     q_text: str = ""
@@ -200,7 +209,7 @@ class State(rx.State):
         self.title = s.title
         self.project_root = s.project_root
         self.edits = s.permissions.get("edits", "ask")
-        self.shell = s.permissions.get("shell", "allowlist")
+        self.shell = s.permissions.get("shell", "smart")
         self.plan_first = s.plan_first
         self.references = list(s.reference_files)
         self.messages = [{"thinking": "", **m} for m in s.messages]
@@ -304,6 +313,38 @@ class State(rx.State):
         self.plan_first = v
         self._save_current()
 
+    # ── Налаштування (#9) ──────────────────────────────────────────────────────
+    @rx.event
+    def toggle_settings(self):
+        self.settings_open = not self.settings_open
+
+    @rx.event
+    def load_settings(self):
+        from agent import settings as S
+        d = S.load()
+        self.theme = d["theme"]
+        self.font_chat = d["font_chat"]
+        self.font_ui = d["font_ui"]
+
+    def _save_settings(self):
+        from agent import settings as S
+        S.save({"theme": self.theme, "font_chat": self.font_chat, "font_ui": self.font_ui})
+
+    @rx.event
+    def set_theme(self, v: str):
+        self.theme = v
+        self._save_settings()
+
+    @rx.event
+    def set_font_chat(self, v: int):
+        self.font_chat = max(12, min(20, int(v)))
+        self._save_settings()
+
+    @rx.event
+    def set_font_ui(self, v: int):
+        self.font_ui = max(11, min(16, int(v)))
+        self._save_settings()
+
     @rx.event
     def save_folder(self):
         self.project_root = self.folder_input.strip()
@@ -360,7 +401,12 @@ class State(rx.State):
             if step.kind == "inline":
                 plan.set_result(step.id, "done", "inline")
                 continue
-            final, log = await self._run_tool_step(step.description, ctx, title=step.description[:60])
+            step_ctx = f"Project root: {root}"
+            if self.context_summary:
+                step_ctx += f"\n{convo.as_context(self.context_summary)}"
+            final, log = await self._run_tool_step(step.description, ctx,
+                                                   title=step.description[:60],
+                                                   context=step_ctx)
             plan.set_result(step.id, "done" if log else "failed", final or "—")
         async with self:
             self._append("assistant", "Готово ✓", "note")
@@ -406,18 +452,22 @@ class State(rx.State):
 
     async def _run_stream(self, gen):
         """Прокрутити стрім із живим лічильником токенів. Повідомлення НЕ додає —
-        повертає (body, thinking, tool_calls). Спільне для answer і chat-режиму."""
+        повертає (body, thinking, tool_calls). Спільне для answer і chat-режиму.
+        Підтримує переривання через _STOP_EVENTS[current_id]."""
         async with self:
             self.streaming = True
             self.stream_content = ""
             self.stream_thinking = ""
             self.status = ""
-            base_out = self.tok_out                      # лічильник може вже мати кроки запиту
+            base_out = self.tok_out
+            cid = self.current_id
         t0 = time.time()
         stats = None
         tool_calls = None
         counted = 0
         while True:
+            if _STOP_EVENTS.get(cid, None) and _STOP_EVENTS[cid].is_set():
+                break
             ev = await asyncio.to_thread(lambda g=gen: next(g, None))
             if ev is None:
                 break
@@ -428,14 +478,14 @@ class State(rx.State):
             async with self:
                 self.stream_content += ev["content"]
                 self.stream_thinking += ev["thinking"]
-                if ev["content"]:                        # приблизний живий tok/s по wall-clock
+                if ev["content"]:
                     counted += 1
                     self.tok_out = base_out + counted
                     el = time.time() - t0
                     if el > 0:
                         self.tok_tps = round(self.tok_out / el, 1)
         async with self:
-            if stats:                                    # замінюємо приблизне точним
+            if stats:
                 self.tok_prompt += stats.get("prompt", 0)
                 self.tok_out = base_out + stats.get("out", counted)
                 self.tok_eval_ns += stats.get("eval_ns", 0)
@@ -443,6 +493,8 @@ class State(rx.State):
             body = (self.stream_content or "").strip()
             thinking = self.stream_thinking
             self.streaming = False
+            self.stopping = False
+            _STOP_EVENTS.pop(cid, None)
         return body, thinking, tool_calls
 
     async def _stream_answer(self, text: str, ctx: str, client):
@@ -511,13 +563,33 @@ class State(rx.State):
                 s.context_summary = new
                 sess.save_session(s)
 
+    @rx.event
+    def stop_generation(self):
+        """Перервати поточну генерацію: встановити stop_event для активної сесії."""
+        import threading
+        cid = self.current_id
+        if not cid:
+            return
+        ev = _STOP_EVENTS.get(cid)
+        if ev:
+            ev.set()
+        else:
+            # якщо stop_event ще не зареєстровано — створюємо вже встановленим
+            e = threading.Event()
+            e.set()
+            _STOP_EVENTS[cid] = e
+        self.stopping = True
+
     @rx.event(background=True)
     async def send_task(self, form_data: dict | None = None):
         """Надсилання. Модель однопотокова: якщо зайнята (busy) — повідомлення стає в
         чергу (додається до наявного) і виконається після з уже свіжим контекстом."""
         async with self:
             if not self.current_id:
-                return
+                s = sess.new_session("Новий чат", "", kind=self.mode)
+                sess.save_session(s)
+                self.sessions = sess.list_sessions()
+                self._select(s.id)
             if self.mode != "chat" and not self.project_root:
                 self._append("assistant", "Спершу вкажіть робочу теку.", "note")
                 return
@@ -583,7 +655,8 @@ class State(rx.State):
                 async with self:
                     self.status = "Виконую запит…"
                 ctx = self._exec_ctx(root, client)
-                final, _ = await self._run_tool_step(text, ctx, context=convo.as_context(summary))
+                shell_ctx = f"Project root: {root}\n{convo.as_context(summary)}" if summary else f"Project root: {root}"
+                final, _ = await self._run_tool_step(text, ctx, context=shell_ctx)
                 so = final or "виконано дії інструментами"
             else:  # plan / edit -> планувальник-діалог
                 async with self:
@@ -811,11 +884,63 @@ def mode_switch() -> rx.Component:
     )
 
 
+def settings_dialog() -> rx.Component:
+    def font_ctrl(label, value, on_dec, on_inc, min_v, max_v):
+        return rx.hstack(
+            rx.text(label, class_name="text-sm text-gray-300 w-36"),
+            rx.icon_button(rx.icon("minus", size=12), on_click=on_dec,
+                           size="1", variant="soft",
+                           disabled=value <= min_v),
+            rx.text(value, class_name="text-sm text-gray-100 w-6 text-center"),
+            rx.icon_button(rx.icon("plus", size=12), on_click=on_inc,
+                           size="1", variant="soft",
+                           disabled=value >= max_v),
+            class_name="items-center gap-2",
+        )
+
+    return rx.dialog.root(
+        rx.dialog.content(
+            rx.vstack(
+                rx.hstack(
+                    rx.heading("Налаштування", size="4"),
+                    rx.spacer(),
+                    rx.dialog.close(
+                        rx.icon_button(rx.icon("x", size=16), variant="ghost", size="1"),
+                    ),
+                    class_name="w-full items-center mb-4",
+                ),
+                # Тема
+                rx.text("Тема", class_name="text-xs text-gray-500 uppercase tracking-wide mb-1"),
+                rx.segmented_control.root(
+                    rx.segmented_control.item("Світла", value="light"),
+                    rx.segmented_control.item("Темна", value="dark"),
+                    rx.segmented_control.item("Авто", value="system"),
+                    value=State.theme,
+                    on_change=State.set_theme,
+                    size="1", class_name="mb-4",
+                ),
+                # Шрифти
+                rx.text("Шрифти", class_name="text-xs text-gray-500 uppercase tracking-wide mb-2"),
+                font_ctrl("Чат (повідомлення)", State.font_chat,
+                          State.set_font_chat(State.font_chat - 1),
+                          State.set_font_chat(State.font_chat + 1), 12, 20),
+                font_ctrl("Інтерфейс", State.font_ui,
+                          State.set_font_ui(State.font_ui - 1),
+                          State.set_font_ui(State.font_ui + 1), 11, 16),
+                gap="2", class_name="min-w-80",
+            ),
+            style={"backgroundColor": PANEL},
+        ),
+        open=State.settings_open,
+        on_open_change=State.toggle_settings,
+    )
+
+
 def sidebar() -> rx.Component:
     return rx.flex(
+        settings_dialog(),
         mode_switch(),
         nav_item("plus", "Новий чат", State.new_chat),
-        nav_item("settings", "Налаштування"),
         rx.text("Recents", class_name="text-xs text-gray-500 uppercase tracking-wide "
                                        "mt-5 mb-1 px-2"),
         rx.vstack(
@@ -827,12 +952,7 @@ def sidebar() -> rx.Component:
             class_name="flex-1 w-full gap-0.5 overflow-y-auto",
         ),
         rx.spacer(),
-        rx.hstack(
-            rx.box("М", class_name="w-7 h-7 rounded-full bg-white/10 text-gray-200 "
-                                   "flex items-center justify-center text-xs"),
-            rx.text("Микола", class_name="text-sm text-gray-200"),
-            class_name="items-center gap-2 px-2 py-2 mt-2 border-t " + BORDER,
-        ),
+        nav_item("settings", "Налаштування", State.toggle_settings),
         direction="column",
         class_name="w-64 h-full p-2 gap-0.5",
         style={"backgroundColor": PANEL, "borderRight": "1px solid rgba(255,255,255,0.08)"},
@@ -891,8 +1011,14 @@ def _code_controls() -> rx.Component:
         ),
         rx.hstack(
             rx.text("консоль", class_name="text-xs text-gray-500"),
-            rx.select(["allowlist", "ask", "off"], value=State.shell, on_change=State.set_shell,
-                      size="1", variant="soft", width="6.2rem"),
+            rx.select(
+                [rx.select.item("smart", value="smart"),
+                 rx.select.item("ask", value="ask"),
+                 rx.select.item("auto", value="auto"),
+                 rx.select.item("allowlist", value="allowlist"),
+                 rx.select.item("off", value="off")],
+                value=State.shell, on_change=State.set_shell,
+                size="1", variant="soft", width="6.2rem"),
             class_name="items-center gap-1",
         ),
         class_name="items-center gap-2",
@@ -916,10 +1042,22 @@ def controls_bar() -> rx.Component:
                 class_name="items-center gap-2",
             ),
         ),
-        rx.button(                                    # доступна й коли busy — щоб стати в чергу
-            rx.cond(State.busy, rx.icon("plus", size=16), rx.icon("arrow-up", size=16)),
-            type="submit",
-            size="1", radius="full", class_name="bg-white text-black ml-1"),
+        rx.cond(
+            State.busy & (State.queued_text == "") & ~State.stopping,
+            # Зайнята + черга порожня + ще не зупиняємось → кнопка Стоп
+            rx.button(
+                rx.icon("square", size=16),
+                on_click=State.stop_generation,
+                size="1", radius="full",
+                class_name="bg-red-500 text-white ml-1 hover:bg-red-600",
+            ),
+            # Інакше → submit (send або + в чергу)
+            rx.button(
+                rx.cond(State.busy, rx.icon("plus", size=16), rx.icon("arrow-up", size=16)),
+                type="submit",
+                size="1", radius="full", class_name="bg-white text-black ml-1",
+            ),
+        ),
         class_name="w-full items-center mt-2 gap-2",
     )
 
@@ -1101,6 +1239,7 @@ def chat_view() -> rx.Component:
         id="chat-scroll",
         on_mount=rx.call_script(SCROLL_SETUP_JS),
         class_name="w-full max-w-2xl mx-auto flex-1 overflow-y-auto px-4 py-6 gap-3",
+        style={"fontSize": State.font_chat},
     )
 
 
@@ -1127,7 +1266,7 @@ def main_area() -> rx.Component:
         rx.center(
             rx.vstack(
                 rx.heading(
-                    rx.cond(State.has_current, State.title, "Back at it, Микола"),
+                    rx.cond(State.has_current, State.title, "Що робимо?"),
                     class_name="text-4xl text-gray-200 mb-2", style=SERIF,
                 ),
                 input_box(),
@@ -1155,4 +1294,5 @@ app = rx.App(
     theme=rx.theme(appearance="dark"),
     stylesheets=["https://fonts.googleapis.com/css2?family=Newsreader:ital@0;1&display=swap"],
 )
-app.add_page(index, title="local-code-agent", on_load=State.load_sessions)
+app.add_page(index, title="local-code-agent",
+             on_load=[State.load_sessions, State.load_settings])

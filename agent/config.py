@@ -17,9 +17,20 @@ REQUEST_TIMEOUT = 600
 # run_shell allow-list: дозволені префікси команд (точний токен або "<prefix> ...").
 # Усе інше блокується БЕЗ виконання. Виконуємо через shell=False (без ланцюжків).
 ALLOWED_SHELL = (
-    "python", "py", "pip list", "pip show",
-    "pytest", "ruff", "flake8", "mypy",
-    "git status", "git diff", "git log",
+    # Python / pip
+    "python", "py",
+    "pip install", "pip uninstall", "pip list", "pip show", "pip freeze",
+    # linters / tests / formatters
+    "pytest", "ruff", "flake8", "mypy", "black", "isort",
+    # git (безпечні операції)
+    "git status", "git diff", "git log", "git show",
+    "git add", "git commit", "git pull", "git push",
+    "git checkout", "git branch", "git merge", "git stash",
+    "git init", "git clone",
+    # інші мови / пакетні менеджери
+    "npm", "node", "npx",
+    "cargo", "rustc",
+    "go ",
 )
 SHELL_TIMEOUT = 120
 

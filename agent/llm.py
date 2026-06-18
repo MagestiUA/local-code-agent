@@ -95,10 +95,12 @@ class OllamaClient:
         return data["message"]
 
     def chat_stream(self, messages: list[dict], tools: list | None = None,
-                    profile: dict = config.EXECUTOR, fmt: str | dict | None = None):
+                    profile: dict = config.EXECUTOR, fmt: str | dict | None = None,
+                    stop_event=None):
         """Стрімовий виклик /api/chat. Генератор подій (див. _stream_event):
         проміжні чанки -> дельти content/thinking; фінальний -> done зі stats.
-        Для прозових шляхів (answer / chat-режим / роздуми планувальника)."""
+        stop_event: threading.Event — якщо встановлено, стрім переривається після
+        поточного чанку (частковий результат зберігається)."""
         payload = {
             "model": self.model,
             "messages": messages,
@@ -117,6 +119,8 @@ class OllamaClient:
                            timeout=config.REQUEST_TIMEOUT) as r:
             r.raise_for_status()
             for line in r.iter_lines():
+                if stop_event and stop_event.is_set():
+                    break
                 if not line:
                     continue
                 try:
@@ -127,3 +131,5 @@ class OllamaClient:
                 if ev["done"]:
                     self.last_stats = ev["stats"]
                 yield ev
+                if stop_event and stop_event.is_set():
+                    break

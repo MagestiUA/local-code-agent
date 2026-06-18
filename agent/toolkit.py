@@ -103,6 +103,7 @@ def h_write_file(args, ctx):
 
 
 def h_run_shell(args, ctx):
+    from .shell_guard import classify
     cmd = (args.get("command") or "").strip()
     mode = ctx.permissions.get("shell", "allowlist")
     if mode == "off":
@@ -111,10 +112,17 @@ def h_run_shell(args, ctx):
         if ctx.confirm and not ctx.confirm(f"Виконати: {cmd}"):
             return "команду відхилено користувачем"
         r = T.run_shell(cmd, cwd=str(ctx.root), allow_all=True)
+    elif mode == "smart":
+        if classify(cmd) == "danger":
+            if ctx.confirm and not ctx.confirm(f"⚠ Небезпечна команда:\n{cmd}"):
+                return "команду відхилено користувачем"
+        r = T.run_shell(cmd, cwd=str(ctx.root), allow_all=True)
+    elif mode == "auto":
+        r = T.run_shell(cmd, cwd=str(ctx.root), allow_all=True)
     else:  # allowlist
         r = T.run_shell(cmd, cwd=str(ctx.root))
         if not r.allowed:
-            return f"заблоковано allow-list: {cmd}"
+            return f"заблоковано allowlist: {cmd}"
     return (r.stdout or r.stderr or f"rc={r.returncode}")[:2000]
 
 
@@ -158,11 +166,20 @@ def default_registry() -> ToolRegistry:
                     [], h_list_dir))
     r.register(Tool("read_file", "Прочитати вміст файлу.",
                     {"path": {"type": "string"}}, ["path"], h_read_file))
-    r.register(Tool("write_file", "Створити або перезаписати файл із заданим вмістом.",
-                    {"path": {"type": "string"}, "content": {"type": "string"}},
+    r.register(Tool("write_file",
+                    "Створити або перезаписати файл із заданим вмістом. "
+                    "Батьківські директорії створюються АВТОМАТИЧНО — не потрібно окремо "
+                    "викликати mkdir чи run_shell для створення тек.",
+                    {"path": {"type": "string", "description": "шлях до файлу (не тека)"},
+                     "content": {"type": "string"}},
                     ["path", "content"], h_write_file))
-    r.register(Tool("run_shell", "Запустити програму в консолі Windows (python, pytest, git).",
-                    {"command": {"type": "string"}}, ["command"], h_run_shell))
+    r.register(Tool("run_shell",
+                    "Запустити команду в консолі Windows. cwd вже встановлено в корінь "
+                    "проєкту. Використовуй для: python, pip install, pytest, git, "
+                    "python -m venv .venv тощо. НЕ використовуй для створення тек або "
+                    "копіювання файлів — для цього є write_file і create_from_source.",
+                    {"command": {"type": "string", "description": "команда для виконання"}},
+                    ["command"], h_run_shell))
     r.register(Tool("edit_file",
                     "Відрефакторити/змінити наявний .py файл за інструкцією "
                     "(великі дані-літерали зберігаються автоматично).",

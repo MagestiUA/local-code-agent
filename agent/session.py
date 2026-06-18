@@ -16,7 +16,7 @@ from pathlib import Path
 
 SESSIONS_DIR = Path.home() / ".local-code-agent" / "sessions"
 
-DEFAULT_PERMISSIONS = {"edits": "ask", "shell": "allowlist"}
+DEFAULT_PERMISSIONS = {"edits": "ask", "shell": "smart"}
 
 
 @dataclass

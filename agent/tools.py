@@ -62,9 +62,23 @@ class ShellResult:
     stderr: str
 
 
+import re as _re
+_VENV_PREFIX = _re.compile(
+    r'^["\']?\.venv[/\\][Ss]cripts[/\\]|^["\']?\.venv[/\\]bin[/\\]',
+    _re.IGNORECASE,
+)
+
+
 def is_allowed(command: str, allow) -> bool:
     c = command.strip()
-    return any(c == a or c.startswith(a + " ") for a in allow)
+    # Перевіряємо і оригінальну команду, і без .venv-префіксу
+    # (.venv\Scripts\pip install → pip install, .venv\Scripts\python → python)
+    c_stripped = _VENV_PREFIX.sub("", c)
+    return any(
+        c == a or c.startswith(a + " ") or
+        c_stripped == a or c_stripped.startswith(a + " ")
+        for a in allow
+    )
 
 
 def run_shell(command: str, cwd: str | None = None, timeout: int | None = None,
