@@ -37,6 +37,10 @@ _CONFIRMS: dict = {}
 # Stop-події для переривання стріму/виконання. Ключ — id сесії.
 _STOP_EVENTS: dict = {}
 
+# Вміст прикріплених файлів поза State (великі рядки не сериалізуємо).
+# {session_id: {filename: content_str}}
+_ATTACHMENT_CONTENT: dict = {}
+
 
 def get_client() -> OllamaClient:
     global _CLIENT
@@ -86,6 +90,8 @@ class State(rx.State):
     queued_text: str = ""                  # повідомлення, що чекає, поки модель зайнята
     stopping: bool = False                 # стоп запитано, чекаємо переривання
     context_summary: str = ""              # контекст-памʼять розмови (підсумок)
+    # Вкладення (#10) — тільки метадані, вміст у _ATTACHMENT_CONTENT
+    attachments: list[dict] = []
     # Налаштування (#9)
     settings_open: bool = False
     theme: str = "dark"
@@ -171,6 +177,7 @@ class State(rx.State):
         return [s for s in self.sessions if s.get("kind", "code") == self.mode]
 
     def _clear_view(self):
+        _ATTACHMENT_CONTENT.pop(self.current_id, None)
         self.current_id = ""
         self.title = ""
         self.project_root = ""
@@ -179,6 +186,7 @@ class State(rx.State):
         self.has_pending = False
         self.queued_text = ""
         self.context_summary = ""
+        self.attachments = []
         self._load_question(None)
 
     @rx.event
@@ -345,6 +353,30 @@ class State(rx.State):
         self.font_ui = max(11, min(16, int(v)))
         self._save_settings()
 
+    # ── Вкладення (#10) ────────────────────────────────────────────────────────
+    @rx.event
+    async def handle_upload(self, files: list[rx.UploadFile]):
+        from agent.attachments import process, MAX_FILES
+        cid = self.current_id or "_tmp"
+        bucket = _ATTACHMENT_CONTENT.setdefault(cid, {})
+        for file in files:
+            if len(self.attachments) >= MAX_FILES:
+                break
+            if any(a["name"] == file.filename for a in self.attachments):
+                continue                           # вже є — пропустити дублікат
+            data = await file.read()
+            result = process(file.filename, data)
+            content = result.pop("_content", "")  # вміст окремо від metadata
+            if content:
+                bucket[file.filename] = content
+            self.attachments = self.attachments + [result]
+
+    @rx.event
+    def remove_attachment(self, name: str):
+        cid = self.current_id or "_tmp"
+        _ATTACHMENT_CONTENT.get(cid, {}).pop(name, None)
+        self.attachments = [a for a in self.attachments if a["name"] != name]
+
     @rx.event
     def save_folder(self):
         self.project_root = self.folder_input.strip()
@@ -394,7 +426,12 @@ class State(rx.State):
 
         ToolContext: edits=auto (план уже схвалено — через plan_first або edits=auto).
         shell передаємо як є; для shell=ask confirm показує модальний попап."""
+        from agent.attachments import find_for_step, format_single
         ctx = self._exec_ctx(root, client)
+        async with self:
+            att_meta = list(self.attachments)
+            cid = self.current_id
+        att_bucket = _ATTACHMENT_CONTENT.get(cid, {})
         for step in plan.steps:
             async with self:
                 self.status = f"Крок #{step.id}: {step.description[:50]}"
@@ -404,6 +441,12 @@ class State(rx.State):
             step_ctx = f"Project root: {root}"
             if self.context_summary:
                 step_ctx += f"\n{convo.as_context(self.context_summary)}"
+            # Додаємо вміст одного файлу, якщо він згаданий у кроці (map-reduce)
+            fname = find_for_step(step.description, att_meta)
+            if fname and fname in att_bucket:
+                meta = next((a for a in att_meta if a["name"] == fname), {})
+                step_ctx += "\n" + format_single(fname, att_bucket[fname],
+                                                 meta.get("truncated", False))
             final, log = await self._run_tool_step(step.description, ctx,
                                                    title=step.description[:60],
                                                    context=step_ctx)
@@ -631,6 +674,9 @@ class State(rx.State):
             plan_first = self.plan_first or self.edits == "ask"
             summary = self.context_summary
             answering = self.has_question
+            # Знімаємо вкладення зі стану (вміст лишається у _ATTACHMENT_CONTENT
+            # поки крок виконавця не забере — потім _clear_view або новий send чистить)
+            self.attachments = []
             if answering:
                 self.has_question = False
                 self.status = "Обмірковую відповідь…"
@@ -708,8 +754,13 @@ class State(rx.State):
         """Один хід планувальника-діалогу: clarify/choose -> питання+кнопки (пауза);
         plan -> готовий план (виконати або показати на підтвердження).
         Повертає (task, outcome) — outcome='' якщо пауза/не виконано (підсумок не потрібен)."""
+        from agent.attachments import attachment_summary
+        async with self:
+            att_meta = list(self.attachments)
+        att_ctx = attachment_summary(att_meta)
+        full_context = (context + "\n\n" + att_ctx).strip() if att_ctx else context
         result = await asyncio.to_thread(
-            lambda: deliberate(task, context, client, doc, history))
+            lambda: deliberate(task, full_context, client, doc, history))
         action = result["action"]
 
         if action in ("clarify", "choose"):
@@ -1025,10 +1076,58 @@ def _code_controls() -> rx.Component:
     )
 
 
+def attachment_chips() -> rx.Component:
+    """Рядок чіпів прикріплених файлів під textarea."""
+    def chip(a: dict) -> rx.Component:
+        has_error = a["error"] != ""
+        return rx.hstack(
+            rx.icon("file", size=12,
+                    class_name=rx.cond(has_error, "text-red-400", "text-gray-400")),
+            rx.text(a["name"], class_name=rx.cond(has_error, "text-red-300", "text-gray-300")
+                    + " text-xs truncate max-w-28"),
+            rx.cond(has_error,
+                    rx.text(a["error"], class_name="text-xs text-red-400 truncate max-w-24"),
+                    rx.fragment()),
+            rx.icon("x", size=11,
+                    class_name="text-gray-500 hover:text-gray-200 cursor-pointer shrink-0",
+                    on_click=lambda: State.remove_attachment(a["name"])),
+            class_name="items-center gap-1 px-2 py-0.5 rounded-full border "
+                       + rx.cond(has_error, "border-red-500/30 bg-red-900/20",
+                                 "border-white/10 bg-white/5"),
+        )
+    return rx.cond(
+        State.attachments,
+        rx.hstack(
+            rx.foreach(State.attachments, chip),
+            class_name="flex-wrap gap-1.5 mt-2",
+        ),
+        rx.fragment(),
+    )
+
+
 def controls_bar() -> rx.Component:
     return rx.hstack(
-        rx.button(rx.icon("paperclip", size=15), type="button", variant="ghost", size="1",
-                  class_name="text-gray-400"),
+        rx.upload(
+            rx.icon_button(rx.icon("paperclip", size=15), type="button", variant="ghost",
+                           size="1", class_name="text-gray-400"),
+            id="file_upload",
+            multiple=True,
+            on_drop=State.handle_upload(rx.upload_files(upload_id="file_upload")),
+            accept={
+                "text/plain": [".txt", ".md", ".csv", ".log", ".rst"],
+                "text/x-python": [".py", ".pyw", ".pyi"],
+                "application/json": [".json", ".jsonc"],
+                "text/javascript": [".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs"],
+                "text/html": [".html", ".htm"],
+                "text/css": [".css", ".scss", ".sass"],
+                "text/yaml": [".yaml", ".yml"],
+                "application/toml": [".toml"],
+                "text/x-sh": [".sh", ".bash", ".zsh", ".bat", ".ps1"],
+                "application/xml": [".xml", ".svg"],
+                "application/sql": [".sql"],
+            },
+            no_drag=True,
+        ),
         rx.cond(State.is_chat, rx.fragment(), _code_controls()),
         rx.spacer(),
         rx.cond(
@@ -1119,6 +1218,7 @@ def input_box() -> rx.Component:
                 ),
                 controls_bar(),
                 rx.cond(State.is_chat, rx.fragment(), references_row()),
+                attachment_chips(),
                 class_name="w-full rounded-2xl p-3 border " + BORDER,
                 style={"backgroundColor": INPUT},
             ),

@@ -23,6 +23,7 @@ class ToolContext:
     permissions: dict = field(default_factory=lambda: {"edits": "ask", "shell": "allowlist"})
     client: object = None
     confirm: Callable | None = None     # (text) -> bool
+    attachments: list = field(default_factory=list)   # метадані вкладень (без вмісту)
 
 
 @dataclass
