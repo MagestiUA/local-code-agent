@@ -1,5 +1,6 @@
 .web
 .states
+reflex.lock/
 *.py[cod]
 assets/external/
 *.db

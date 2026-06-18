@@ -1,4 +1,2 @@
 requests
-nicegui
-
 reflex==0.9.5.post2
