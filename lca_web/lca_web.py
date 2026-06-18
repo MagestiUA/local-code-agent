@@ -123,6 +123,13 @@ class State(rx.State):
         self._recompute_tps()
 
     @rx.var
+    def tokens_label(self) -> str:
+        # ctx (prompt_eval_count) Ollama віддає лише у фінальному чанку — поки невідомо
+        # й модель ще працює, показуємо «…», а не оманливий 0.
+        ctx = "…" if (self.busy and self.tok_prompt == 0) else str(self.tok_prompt)
+        return f"↑{ctx} ctx · ↓{self.tok_out} out · {self.tok_tps} tok/s"
+
+    @rx.var
     def folder_name(self) -> str:
         return Path(self.project_root).name if self.project_root else "тека"
 
@@ -657,11 +664,7 @@ def token_bar() -> rx.Component:
         (State.tok_out > 0) | State.busy,
         rx.hstack(
             rx.cond(State.busy, rx.spinner(size="1"), rx.fragment()),
-            rx.text(
-                "↑" + State.tok_prompt.to_string() + " ctx · ↓"
-                + State.tok_out.to_string() + " out · "
-                + State.tok_tps.to_string() + " tok/s",
-                class_name="text-xs text-gray-500 font-mono"),
+            rx.text(State.tokens_label, class_name="text-xs text-gray-500 font-mono"),
             class_name="items-center gap-2 self-start px-1 mb-1",
         ),
         rx.box(class_name="h-0"),
