@@ -35,13 +35,20 @@ def get_client() -> OllamaClient:
     return _CLIENT
 
 
-def _fmt_tokens(stats: list[dict]) -> str:
-    """Рядок-футер лічильника з агрегату stats (сума по викликах моделі кроку)."""
-    prompt = sum(s.get("prompt", 0) for s in stats)
-    out = sum(s.get("out", 0) for s in stats)
-    ns = sum(s.get("eval_ns", 0) for s in stats)
-    tps = round(out / (ns / 1e9), 1) if ns else 0.0
-    return f"`↑{prompt} ctx · ↓{out} out · {tps} tok/s`"
+SCROLL_SETUP_JS = """
+(() => {
+  const c = document.getElementById('chat-scroll');
+  if (!c || c._lcaObs) return;
+  let stick = true;
+  const nearBottom = () => c.scrollHeight - c.scrollTop - c.clientHeight < 120;
+  c.addEventListener('scroll', () => { stick = nearBottom(); });
+  const obs = new MutationObserver(() => { if (stick) c.scrollTop = c.scrollHeight; });
+  obs.observe(c, {childList: true, subtree: true, characterData: true});
+  c._lcaObs = obs;
+  c.scrollTop = c.scrollHeight;
+})();
+"""
+SCROLL_BOTTOM_JS = "var c=document.getElementById('chat-scroll'); if(c){c.scrollTop=c.scrollHeight;}"
 
 
 BG = "#262624"
@@ -76,9 +83,11 @@ class State(rx.State):
     streaming: bool = False
     stream_content: str = ""
     stream_thinking: str = ""
-    stream_prompt_tokens: int = 0
-    stream_out_tokens: int = 0
-    stream_tps: float = 0.0
+    # лічильник токенів поточного запиту (над полем вводу; скидається на новий запит)
+    tok_prompt: int = 0
+    tok_out: int = 0
+    tok_eval_ns: int = 0
+    tok_tps: float = 0.0
 
     @rx.event
     def set_task(self, v: str):
@@ -98,6 +107,20 @@ class State(rx.State):
     @rx.event
     def confirm_no(self):
         self._resolve_confirm(False)
+
+    # ── Лічильник токенів (викликати лише всередині `async with self`) ─────────
+    def _reset_tokens(self):
+        self.tok_prompt = self.tok_out = self.tok_eval_ns = 0
+        self.tok_tps = 0.0
+
+    def _recompute_tps(self):
+        self.tok_tps = round(self.tok_out / (self.tok_eval_ns / 1e9), 1) if self.tok_eval_ns else 0.0
+
+    def _add_stats(self, stats: list[dict]):
+        self.tok_prompt += sum(s.get("prompt", 0) for s in stats)
+        self.tok_out += sum(s.get("out", 0) for s in stats)
+        self.tok_eval_ns += sum(s.get("eval_ns", 0) for s in stats)
+        self._recompute_tps()
 
     @rx.var
     def folder_name(self) -> str:
@@ -312,26 +335,25 @@ class State(rx.State):
         content = f"**{head}**"
         if final:
             content += f"\n\n{final}"
-        content += "\n\n" + _fmt_tokens(stats)
         async with self:
+            self._add_stats(stats)                       # лічильник над полем вводу
             self._append("assistant", content, "step", thinking=log_md)
         return final, log
 
     async def _stream_answer(self, text: str, ctx: str, client):
         """Стрімить відповідь (answer-режим) з живим лічильником токенів + tok/s.
         Блокуючий генератор тягнемо по чанку через to_thread, щоб цикл лишався
-        живим; кожен чанк оновлює stream_*; у фіналі — точні stats із метаданих."""
+        живим; кожен чанк оновлює tok_* (лічильник над полем); у фіналі — точні stats."""
         async with self:
             self.streaming = True
             self.stream_content = ""
             self.stream_thinking = ""
-            self.stream_prompt_tokens = 0
-            self.stream_out_tokens = 0
-            self.stream_tps = 0.0
             self.status = ""
+            base_out = self.tok_out                      # лічильник може вже мати кроки запиту
         gen = answer_stream(text, ctx, client)
         t0 = time.time()
         stats = None
+        counted = 0
         while True:
             ev = await asyncio.to_thread(lambda g=gen: next(g, None))
             if ev is None:
@@ -342,21 +364,19 @@ class State(rx.State):
             async with self:
                 self.stream_content += ev["content"]
                 self.stream_thinking += ev["thinking"]
-                if ev["content"]:                       # рахуємо лише токени виводу
-                    self.stream_out_tokens += 1
+                if ev["content"]:                        # приблизний живий tok/s по wall-clock
+                    counted += 1
+                    self.tok_out = base_out + counted
                     el = time.time() - t0
                     if el > 0:
-                        self.stream_tps = round(self.stream_out_tokens / el, 1)
+                        self.tok_tps = round(self.tok_out / el, 1)
         async with self:
             if stats:                                    # замінюємо приблизне точним
-                self.stream_prompt_tokens = stats.get("prompt", 0)
-                self.stream_out_tokens = stats.get("out", self.stream_out_tokens)
-                ns = stats.get("eval_ns", 0)
-                if ns:
-                    self.stream_tps = round(self.stream_out_tokens / (ns / 1e9), 1)
-            meta = (f"`↑{self.stream_prompt_tokens} ctx · ↓{self.stream_out_tokens} out "
-                    f"· {self.stream_tps} tok/s`")
-            body = (self.stream_content or "").strip() + "\n\n" + meta
+                self.tok_prompt += stats.get("prompt", 0)
+                self.tok_out = base_out + stats.get("out", counted)
+                self.tok_eval_ns += stats.get("eval_ns", 0)
+                self._recompute_tps()
+            body = (self.stream_content or "").strip()
             self._append("assistant", body, "answer", thinking=self.stream_thinking)
             self.streaming = False
 
@@ -374,6 +394,7 @@ class State(rx.State):
             self.task = ""
             self._append("user", text)
             self.busy = True
+            self._reset_tokens()
             self.status = "Визначаю тип запиту…"
             root = self.project_root
             refs = [str(x) for x in self.references]
@@ -630,22 +651,43 @@ def references_row() -> rx.Component:
     )
 
 
+def token_bar() -> rx.Component:
+    """Лічильник токенів поточного запиту — над полем вводу. Спінер поки busy."""
+    return rx.cond(
+        (State.tok_out > 0) | State.busy,
+        rx.hstack(
+            rx.cond(State.busy, rx.spinner(size="1"), rx.fragment()),
+            rx.text(
+                "↑" + State.tok_prompt.to_string() + " ctx · ↓"
+                + State.tok_out.to_string() + " out · "
+                + State.tok_tps.to_string() + " tok/s",
+                class_name="text-xs text-gray-500 font-mono"),
+            class_name="items-center gap-2 self-start px-1 mb-1",
+        ),
+        rx.box(class_name="h-0"),
+    )
+
+
 def input_box() -> rx.Component:
     return rx.form(
-        rx.box(
-            rx.text_area(
-                placeholder="Опишіть задачу...  (Enter — надіслати, Shift+Enter — новий рядок)",
-                value=State.task,
-                on_change=State.set_task,
-                enter_key_submit=True,
-                class_name="w-full bg-transparent text-gray-100 placeholder:text-gray-500 "
-                           "resize-none outline-none border-none text-base",
-                rows="2",
+        rx.vstack(
+            token_bar(),
+            rx.box(
+                rx.text_area(
+                    placeholder="Опишіть задачу...  (Enter — надіслати, Shift+Enter — новий рядок)",
+                    value=State.task,
+                    on_change=State.set_task,
+                    enter_key_submit=True,
+                    class_name="w-full bg-transparent text-gray-100 placeholder:text-gray-500 "
+                               "resize-none outline-none border-none text-base",
+                    rows="2",
+                ),
+                controls_bar(),
+                references_row(),
+                class_name="w-full rounded-2xl p-3 border " + BORDER,
+                style={"backgroundColor": INPUT},
             ),
-            controls_bar(),
-            references_row(),
-            class_name="w-full max-w-2xl rounded-2xl p-3 border " + BORDER,
-            style={"backgroundColor": INPUT},
+            class_name="w-full max-w-2xl gap-0",
         ),
         on_submit=State.send_task,
         reset_on_submit=False,
@@ -702,8 +744,8 @@ def status_line() -> rx.Component:
 
 
 def streaming_bubble() -> rx.Component:
-    """Тимчасова бульбашка під час стріму: роздуми під катом + контент + живий
-    лічильник токенів/швидкості, що оновлюється по ходу генерації."""
+    """Тимчасова бульбашка під час стріму: роздуми під катом + контент.
+    Лічильник токенів — над полем вводу (token_bar)."""
     return rx.box(
         rx.cond(
             State.stream_thinking != "",
@@ -717,15 +759,6 @@ def streaming_bubble() -> rx.Component:
             rx.fragment(),
         ),
         rx.markdown(State.stream_content),
-        rx.hstack(
-            rx.spinner(size="1"),
-            rx.text(
-                "↑" + State.stream_prompt_tokens.to_string() + " ctx · ↓"
-                + State.stream_out_tokens.to_string() + " out · "
-                + State.stream_tps.to_string() + " tok/s",
-                class_name="text-xs text-gray-500 font-mono"),
-            class_name="items-center gap-2 mt-1",
-        ),
         class_name="self-start bg-white/[0.03] rounded-2xl px-4 py-2.5 max-w-[85%] text-sm",
     )
 
@@ -736,7 +769,20 @@ def chat_view() -> rx.Component:
         rx.cond(State.streaming, streaming_bubble(), rx.fragment()),
         status_line(),
         rx.cond(State.has_pending, pending_bar(), rx.fragment()),
+        id="chat-scroll",
+        on_mount=rx.call_script(SCROLL_SETUP_JS),
         class_name="w-full max-w-2xl mx-auto flex-1 overflow-y-auto px-4 py-6 gap-3",
+    )
+
+
+def scroll_down_button() -> rx.Component:
+    """Кнопка-стрілка: промотати чат донизу."""
+    return rx.button(
+        rx.icon("arrow-down", size=18),
+        on_click=rx.call_script(SCROLL_BOTTOM_JS),
+        radius="full", size="2",
+        class_name="absolute bottom-4 right-4 bg-white/10 hover:bg-white/20 text-gray-100 "
+                   "shadow-lg backdrop-blur z-10",
     )
 
 
@@ -745,8 +791,9 @@ def main_area() -> rx.Component:
         State.messages,
         rx.vstack(
             chat_view(),
+            scroll_down_button(),
             rx.box(input_box(), class_name="w-full px-4 pb-4 flex justify-center"),
-            class_name="flex-1 h-full w-full",
+            class_name="flex-1 h-full w-full relative",
         ),
         rx.center(
             rx.vstack(
