@@ -11,6 +11,7 @@ from pathlib import Path
 
 import reflex as rx
 
+from agent import config
 from agent import convo
 from agent import session as sess
 from agent.agent_loop import run_step
@@ -20,7 +21,12 @@ from agent.llm import OllamaClient
 from agent.memory import render_for_planner
 from agent.planner import deliberate
 from agent.project import load_project_doc, scan_structure
-from agent.toolkit import ToolContext
+from agent.toolkit import ToolContext, default_registry
+
+CHAT_SYSTEM = (
+    "You are a helpful thinking assistant. You can search the web with the web_search "
+    "tool when you need current or external information. Answer in the user's language."
+)
 
 _CLIENT = None
 
@@ -61,6 +67,7 @@ SERIF = {"fontFamily": "Newsreader, Georgia, serif"}
 
 class State(rx.State):
     sessions: list[dict] = []
+    mode: str = "code"                     # активний режим: "code" (агент) | "chat" (легкий чат)
     current_id: str = ""
     title: str = ""
     project_root: str = ""
@@ -144,6 +151,34 @@ class State(rx.State):
     def has_current(self) -> bool:
         return self.current_id != ""
 
+    @rx.var
+    def is_chat(self) -> bool:
+        return self.mode == "chat"
+
+    @rx.var
+    def visible_sessions(self) -> list[dict]:
+        """Чати поточного режиму (Чат/Код роздільні списки)."""
+        return [s for s in self.sessions if s.get("kind", "code") == self.mode]
+
+    def _clear_view(self):
+        self.current_id = ""
+        self.title = ""
+        self.project_root = ""
+        self.messages = []
+        self.references = []
+        self.has_pending = False
+        self.context_summary = ""
+        self._load_question(None)
+
+    @rx.event
+    def set_mode(self, m: str):
+        if m == self.mode:
+            return
+        self.mode = m
+        cur = next((s for s in self.sessions if s["id"] == self.current_id), None)
+        if not cur or cur.get("kind", "code") != m:   # відкритий чат іншого типу -> згорнути
+            self._clear_view()
+
     @rx.event
     def set_folder_input(self, v: str):
         self.folder_input = v
@@ -159,6 +194,7 @@ class State(rx.State):
     def _select(self, sid: str):
         s = sess.load_session(sid)
         self.current_id = s.id
+        self.mode = s.kind
         self.title = s.title
         self.project_root = s.project_root
         self.edits = s.permissions.get("edits", "ask")
@@ -205,7 +241,7 @@ class State(rx.State):
 
     @rx.event
     def new_chat(self):
-        s = sess.new_session("Новий чат", "")
+        s = sess.new_session("Новий чат", "", kind=self.mode)
         sess.save_session(s)
         self.sessions = sess.list_sessions()
         self._select(s.id)
@@ -243,14 +279,7 @@ class State(rx.State):
     def delete_chat(self, sid: str):
         sess.delete_session(sid)
         if self.current_id == sid:
-            self.current_id = ""
-            self.title = ""
-            self.project_root = ""
-            self.messages = []
-            self.references = []
-            self.has_pending = False
-            self.context_summary = ""
-            self._load_question(None)
+            self._clear_view()
         self.sessions = sess.list_sessions()
 
     @rx.event
@@ -373,19 +402,18 @@ class State(rx.State):
             self._append("assistant", content, "step", thinking=log_md)
         return final, log
 
-    async def _stream_answer(self, text: str, ctx: str, client):
-        """Стрімить відповідь (answer-режим) з живим лічильником токенів + tok/s.
-        Блокуючий генератор тягнемо по чанку через to_thread, щоб цикл лишався
-        живим; кожен чанк оновлює tok_* (лічильник над полем); у фіналі — точні stats."""
+    async def _run_stream(self, gen):
+        """Прокрутити стрім із живим лічильником токенів. Повідомлення НЕ додає —
+        повертає (body, thinking, tool_calls). Спільне для answer і chat-режиму."""
         async with self:
             self.streaming = True
             self.stream_content = ""
             self.stream_thinking = ""
             self.status = ""
             base_out = self.tok_out                      # лічильник може вже мати кроки запиту
-        gen = answer_stream(text, ctx, client)
         t0 = time.time()
         stats = None
+        tool_calls = None
         counted = 0
         while True:
             ev = await asyncio.to_thread(lambda g=gen: next(g, None))
@@ -393,6 +421,7 @@ class State(rx.State):
                 break
             if ev["done"]:
                 stats = ev.get("stats")
+                tool_calls = ev.get("tool_calls")
                 break
             async with self:
                 self.stream_content += ev["content"]
@@ -410,8 +439,53 @@ class State(rx.State):
                 self.tok_eval_ns += stats.get("eval_ns", 0)
                 self._recompute_tps()
             body = (self.stream_content or "").strip()
-            self._append("assistant", body, "answer", thinking=self.stream_thinking)
+            thinking = self.stream_thinking
             self.streaming = False
+        return body, thinking, tool_calls
+
+    async def _stream_answer(self, text: str, ctx: str, client):
+        """Стрімить відповідь answer-режиму (без тулів)."""
+        body, thinking, _ = await self._run_stream(answer_stream(text, ctx, client))
+        async with self:
+            self._append("assistant", body, "answer", thinking=thinking)
+        return body
+
+    async def _chat_reply(self, text: str, client) -> str:
+        """Чат-режим: стрім думаючої моделі + web_search. Стрімимо з тулами; якщо у
+        фінальному чанку є tool_calls — виконуємо пошук, дописуємо й стрімимо далі."""
+        reg = default_registry()
+        ws = [t for t in reg.schema() if t["function"]["name"] == "web_search"]
+        tctx = ToolContext(root=Path.home(), permissions={"edits": "off", "shell": "off"})
+        async with self:
+            history = [{"role": m["role"], "content": m["content"]}
+                       for m in self.messages
+                       if m["role"] in ("user", "assistant")
+                       and m.get("kind", "text") in ("text", "answer") and m["content"]][-20:]
+        msgs = [{"role": "system", "content": CHAT_SYSTEM}] + history
+        body = ""
+        for _ in range(3):
+            body, thinking, tool_calls = await self._run_stream(
+                client.chat_stream(msgs, tools=ws, profile=config.PLANNER))
+            if not tool_calls:
+                async with self:
+                    self._append("assistant", body, "answer", thinking=thinking)
+                break
+            msgs.append({"role": "assistant", "content": body, "tool_calls": tool_calls})
+            for call in tool_calls:
+                args = call.get("function", {}).get("arguments", {})
+                if isinstance(args, str):
+                    import json as _json
+                    try:
+                        args = _json.loads(args)
+                    except Exception:
+                        args = {}
+                query = args.get("query", "")
+                async with self:
+                    self.status = f"Шукаю: {query}"
+                result = await asyncio.to_thread(lambda a=args: reg.dispatch("web_search", a, tctx))
+                msgs.append({"role": "tool", "content": result})
+                async with self:
+                    self._append("assistant", f"🔎 {query}", "step", thinking=result)
         return body
 
     async def _update_summary(self, user_text: str, outcome: str, client):
@@ -435,7 +509,8 @@ class State(rx.State):
         async with self:
             if not self.current_id:
                 return
-            if not self.project_root:
+            chat_mode = self.mode == "chat"
+            if not chat_mode and not self.project_root:
                 self._append("assistant", "Спершу вкажіть робочу теку.", "note")
                 return
             text = self.task.strip()
@@ -454,11 +529,13 @@ class State(rx.State):
                 self.has_question = False
                 self.status = "Обмірковую відповідь…"
             else:
-                self.status = "Визначаю тип запиту…"
+                self.status = "Думаю…" if chat_mode else "Визначаю тип запиту…"
 
         client = await asyncio.to_thread(get_client)
 
-        if answering:
+        if chat_mode:
+            await self._chat_reply(text, client)
+        elif answering:
             await self._resume_planning(text, root, plan_first, client)
         else:
             mode = await asyncio.to_thread(lambda: classify_intent(text, client))
@@ -675,16 +752,35 @@ def confirm_dialog() -> rx.Component:
     )
 
 
+def mode_switch() -> rx.Component:
+    """Верхній перемикач режимів Чат | Код."""
+    def tab(label: str, m: str, icon: str) -> rx.Component:
+        active = State.mode == m
+        return rx.hstack(
+            rx.icon(icon, size=14),
+            rx.text(label, class_name="text-sm"),
+            on_click=lambda: State.set_mode(m),
+            class_name=rx.cond(active, "bg-white/10 text-gray-100", "text-gray-400 hover:bg-white/5")
+            + " items-center justify-center gap-1.5 grow rounded-md py-1.5 cursor-pointer",
+        )
+    return rx.hstack(
+        tab("Чат", "chat", "message-circle"),
+        tab("Код", "code", "code"),
+        class_name="w-full gap-1 p-1 rounded-lg bg-white/[0.03] mb-1",
+    )
+
+
 def sidebar() -> rx.Component:
     return rx.flex(
+        mode_switch(),
         nav_item("plus", "Новий чат", State.new_chat),
         nav_item("settings", "Налаштування"),
         rx.text("Recents", class_name="text-xs text-gray-500 uppercase tracking-wide "
                                        "mt-5 mb-1 px-2"),
         rx.vstack(
             rx.cond(
-                State.sessions,
-                rx.foreach(State.sessions, session_item),
+                State.visible_sessions,
+                rx.foreach(State.visible_sessions, session_item),
                 rx.text("Поки немає чатів", class_name="text-sm text-gray-400 px-2"),
             ),
             class_name="flex-1 w-full gap-0.5 overflow-y-auto",
@@ -742,10 +838,9 @@ def ref_dialog() -> rx.Component:
     )
 
 
-def controls_bar() -> rx.Component:
+def _code_controls() -> rx.Component:
+    """Контроли лише для Код-режиму: тека, дозволи, план наперед."""
     return rx.hstack(
-        rx.button(rx.icon("paperclip", size=15), type="button", variant="ghost", size="1",
-                  class_name="text-gray-400"),
         folder_dialog(),
         rx.hstack(
             rx.text("правки", class_name="text-xs text-gray-500"),
@@ -759,9 +854,27 @@ def controls_bar() -> rx.Component:
                       size="1", variant="soft", width="6.2rem"),
             class_name="items-center gap-1",
         ),
+        class_name="items-center gap-2",
+    )
+
+
+def controls_bar() -> rx.Component:
+    return rx.hstack(
+        rx.button(rx.icon("paperclip", size=15), type="button", variant="ghost", size="1",
+                  class_name="text-gray-400"),
+        rx.cond(State.is_chat, rx.fragment(), _code_controls()),
         rx.spacer(),
-        rx.text("план наперед", class_name="text-xs text-gray-500"),
-        rx.switch(checked=State.plan_first, on_change=State.set_plan_first, size="1"),
+        rx.cond(
+            State.is_chat,
+            rx.hstack(rx.icon("globe", size=14, class_name="text-gray-500"),
+                      rx.text("веб-пошук", class_name="text-xs text-gray-500"),
+                      class_name="items-center gap-1"),
+            rx.hstack(
+                rx.text("план наперед", class_name="text-xs text-gray-500"),
+                rx.switch(checked=State.plan_first, on_change=State.set_plan_first, size="1"),
+                class_name="items-center gap-2",
+            ),
+        ),
         rx.button(
             rx.cond(State.busy, rx.spinner(size="1"), rx.icon("arrow-up", size=16)),
             type="submit", disabled=State.busy,
@@ -807,7 +920,10 @@ def input_box() -> rx.Component:
             token_bar(),
             rx.box(
                 rx.text_area(
-                    placeholder="Опишіть задачу...  (Enter — надіслати, Shift+Enter — новий рядок)",
+                    placeholder=rx.cond(
+                        State.is_chat,
+                        "Напишіть повідомлення…  (Enter — надіслати, Shift+Enter — новий рядок)",
+                        "Опишіть задачу...  (Enter — надіслати, Shift+Enter — новий рядок)"),
                     value=State.task,
                     on_change=State.set_task,
                     enter_key_submit=True,
@@ -816,7 +932,7 @@ def input_box() -> rx.Component:
                     rows="2",
                 ),
                 controls_bar(),
-                references_row(),
+                rx.cond(State.is_chat, rx.fragment(), references_row()),
                 class_name="w-full rounded-2xl p-3 border " + BORDER,
                 style={"backgroundColor": INPUT},
             ),

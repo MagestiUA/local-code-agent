@@ -24,6 +24,7 @@ class Session:
     id: str
     title: str
     project_root: str
+    kind: str = "code"                                    # "code" (агент) | "chat" (легкий чат)
     permissions: dict = field(default_factory=lambda: dict(DEFAULT_PERMISSIONS))
     init_scan: bool = False
     plan_first: bool = False                              # завжди планувати наперед
@@ -77,12 +78,13 @@ def _dir(base: str | Path | None = None) -> Path:
     return d
 
 
-def new_session(title: str, project_root: str | Path,
-                permissions: dict | None = None, init_scan: bool = False) -> Session:
+def new_session(title: str, project_root: str | Path, permissions: dict | None = None,
+                init_scan: bool = False, kind: str = "code") -> Session:
     return Session(
         id=uuid.uuid4().hex[:12],
         title=title,
         project_root=str(project_root),
+        kind=kind,
         permissions=permissions or dict(DEFAULT_PERMISSIONS),
         init_scan=init_scan,
     )
@@ -112,7 +114,8 @@ def list_sessions(base: str | Path | None = None) -> list[dict]:
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
             out.append({"id": d["id"], "title": d["title"],
-                        "project_root": d["project_root"], "updated": d.get("updated")})
+                        "project_root": d["project_root"], "updated": d.get("updated"),
+                        "kind": d.get("kind", "code")})
         except Exception:
             pass
     return out
