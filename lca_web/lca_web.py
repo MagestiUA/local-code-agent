@@ -17,8 +17,8 @@ from agent.answerer import answer_stream, build_context
 from agent.intent import classify_intent
 from agent.llm import OllamaClient
 from agent.memory import render_for_planner
-from agent.planner import make_plan
-from agent.project import load_project_doc
+from agent.planner import deliberate
+from agent.project import load_project_doc, scan_structure
 from agent.toolkit import ToolContext
 
 _CLIENT = None
@@ -72,6 +72,11 @@ class State(rx.State):
     task: str = ""
     messages: list[dict] = []
     has_pending: bool = False
+    # планувальник-діалог (#2+#5): питання/вибір, що очікує відповіді
+    has_question: bool = False
+    q_text: str = ""
+    q_reasoning: str = ""
+    q_options: list[dict] = []
     busy: bool = False
     status: str = ""
     rename_open: bool = False
@@ -160,6 +165,20 @@ class State(rx.State):
         self.references = list(s.reference_files)
         self.messages = [{"thinking": "", **m} for m in s.messages]
         self.has_pending = s.pending_plan is not None
+        self._load_question(s.pending_question)
+
+    def _load_question(self, q: dict | None):
+        """Відновити стан питання планувальника зі збереженого pending_question."""
+        if q:
+            self.has_question = True
+            self.q_text = q.get("question", "")
+            self.q_reasoning = q.get("reasoning", "")
+            self.q_options = list(q.get("options", []))
+        else:
+            self.has_question = False
+            self.q_text = ""
+            self.q_reasoning = ""
+            self.q_options = []
 
     def _append(self, role: str, content: str, kind: str = "text", thinking: str = ""):
         self.messages = self.messages + [
@@ -227,6 +246,7 @@ class State(rx.State):
             self.messages = []
             self.references = []
             self.has_pending = False
+            self._load_question(None)
         self.sessions = sess.list_sessions()
 
     @rx.event
@@ -402,44 +422,118 @@ class State(rx.State):
             self._append("user", text)
             self.busy = True
             self._reset_tokens()
-            self.status = "Визначаю тип запиту…"
             root = self.project_root
             refs = [str(x) for x in self.references]
             plan_first = self.plan_first or self.edits == "ask"
+            answering = self.has_question          # вписана відповідь на питання планувальника
+            if answering:
+                self.has_question = False
+                self.status = "Обмірковую відповідь…"
+            else:
+                self.status = "Визначаю тип запиту…"
 
         client = await asyncio.to_thread(get_client)
-        mode = await asyncio.to_thread(lambda: classify_intent(text, client))
 
-        if mode == "answer":
-            async with self:
-                self.status = "Аналізую код…"
-            ctx = await asyncio.to_thread(lambda: build_context(root, refs, text))
-            await self._stream_answer(text, ctx, client)
-
-        elif mode == "shell":
-            async with self:
-                self.status = "Виконую запит…"
-            ctx = self._exec_ctx(root, client)
-            await self._run_tool_step(text, ctx)
-
-        else:  # plan / edit
-            async with self:
-                self.status = "Складаю план…"
-            doc = await asyncio.to_thread(lambda: load_project_doc(root))
-            plan = await asyncio.to_thread(lambda: make_plan(text, "", client, doc))
-            if plan_first:
+        if answering:
+            await self._resume_planning(text, root, plan_first, client)
+        else:
+            mode = await asyncio.to_thread(lambda: classify_intent(text, client))
+            if mode == "answer":
                 async with self:
-                    self._append("assistant", render_for_planner(plan), "plan")
-                    s = sess.load_session(self.current_id)
-                    s.set_pending_plan(plan)
-                    sess.save_session(s)
-                    self.has_pending = True
-            else:
-                await self._execute_steps(plan, root, client)
+                    self.status = "Аналізую код…"
+                ctx = await asyncio.to_thread(lambda: build_context(root, refs, text))
+                await self._stream_answer(text, ctx, client)
+            elif mode == "shell":
+                async with self:
+                    self.status = "Виконую запит…"
+                ctx = self._exec_ctx(root, client)
+                await self._run_tool_step(text, ctx)
+            else:  # plan / edit -> планувальник-діалог
+                async with self:
+                    self.status = "Обмірковую план…"
+                doc = await asyncio.to_thread(lambda: load_project_doc(root))
+                struct = await asyncio.to_thread(lambda: scan_structure(root))
+                await self._deliberate_flow(text, struct, doc, [], root, plan_first, client)
 
         async with self:
             self.busy = False
             self.status = ""
+
+    @rx.event(background=True)
+    async def answer_planner(self, value: str):
+        """Відповідь на питання планувальника кліком по кандидату."""
+        async with self:
+            if not self.has_question or self.busy or not self.current_id:
+                return
+            self.busy = True
+            self._reset_tokens()
+            self._append("user", value)
+            self.has_question = False
+            self.status = "Обмірковую відповідь…"
+            root = self.project_root
+            plan_first = self.plan_first or self.edits == "ask"
+        client = await asyncio.to_thread(get_client)
+        await self._resume_planning(value, root, plan_first, client)
+        async with self:
+            self.busy = False
+            self.status = ""
+
+    async def _resume_planning(self, value: str, root: str, plan_first: bool, client):
+        """Продовжити планування після відповіді користувача: додати її в history,
+        повторити deliberate."""
+        async with self:
+            s = sess.load_session(self.current_id)
+            q = s.pending_question or {}
+        history = list(q.get("history") or []) + [{"question": q.get("question", ""), "answer": value}]
+        task = q.get("task", value)
+        await self._deliberate_flow(task, q.get("context", ""), q.get("doc"),
+                                    history, root, plan_first, client)
+
+    async def _deliberate_flow(self, task: str, context: str, doc, history: list,
+                               root: str, plan_first: bool, client):
+        """Один хід планувальника-діалогу: clarify/choose -> питання+кнопки (пауза);
+        plan -> готовий план (виконати або показати на підтвердження)."""
+        result = await asyncio.to_thread(
+            lambda: deliberate(task, context, client, doc, history))
+        action = result["action"]
+
+        if action in ("clarify", "choose"):
+            q = {"task": task, "context": context, "doc": doc, "history": history,
+                 "question": result["question"], "reasoning": result["reasoning"],
+                 "options": result["options"]}
+            async with self:
+                head = (result["reasoning"] + "\n\n") if result["reasoning"] else ""
+                self._append("assistant", f"{head}**{result['question']}**", "plan")
+                self.q_text = result["question"]
+                self.q_reasoning = result["reasoning"]
+                self.q_options = result["options"]
+                self.has_question = True
+                s = sess.load_session(self.current_id)
+                s.set_pending_question(q)
+                s.clear_pending_plan()
+                sess.save_session(s)
+            return
+
+        # action == "plan"
+        state = result["state"]
+        async with self:
+            s = sess.load_session(self.current_id)
+            s.clear_pending_question()
+            sess.save_session(s)
+            self._load_question(None)
+        if not state or not state.steps:
+            async with self:
+                self._append("assistant", "Не вдалося скласти план.", "note")
+            return
+        if plan_first:
+            async with self:
+                self._append("assistant", render_for_planner(state), "plan")
+                s = sess.load_session(self.current_id)
+                s.set_pending_plan(state)
+                sess.save_session(s)
+                self.has_pending = True
+        else:
+            await self._execute_steps(state, root, client)
 
     @rx.event(background=True)
     async def execute_pending(self):
@@ -470,6 +564,14 @@ class State(rx.State):
             s.clear_pending_plan()
             sess.save_session(s)
         self.has_pending = False
+
+    @rx.event
+    def cancel_question(self):
+        if self.current_id:
+            s = sess.load_session(self.current_id)
+            s.clear_pending_question()
+            sess.save_session(s)
+        self._load_question(None)
 
 
 def nav_item(icon: str, label: str, on_click=None) -> rx.Component:
@@ -734,6 +836,37 @@ def pending_bar() -> rx.Component:
     )
 
 
+def q_option(opt: dict) -> rx.Component:
+    """Клікабельний кандидат/підхід — відповідь на питання планувальника."""
+    return rx.box(
+        rx.text(opt["label"], class_name="text-sm text-gray-100 font-medium"),
+        rx.cond(
+            opt["detail"] != "",
+            rx.text(opt["detail"], class_name="text-xs text-gray-400"),
+            rx.fragment(),
+        ),
+        on_click=lambda: State.answer_planner(opt["label"]),
+        class_name="cursor-pointer rounded-lg px-3 py-2 bg-white/5 hover:bg-white/10 "
+                   "border " + BORDER,
+    )
+
+
+def question_bar() -> rx.Component:
+    """Питання планувальника: клікабельні кандидати + підказка, що можна й вписати."""
+    return rx.vstack(
+        rx.hstack(rx.foreach(State.q_options, q_option),
+                  class_name="flex-wrap gap-2 items-stretch"),
+        rx.hstack(
+            rx.text("…або впишіть відповідь у поле нижче",
+                    class_name="text-xs text-gray-500"),
+            rx.button("Скасувати", on_click=State.cancel_question,
+                      variant="ghost", size="1", class_name="text-gray-400"),
+            class_name="items-center gap-2",
+        ),
+        class_name="self-start gap-2 mt-1",
+    )
+
+
 def status_line() -> rx.Component:
     return rx.cond(
         State.busy & ~State.streaming,
@@ -772,6 +905,7 @@ def chat_view() -> rx.Component:
         rx.cond(State.streaming, streaming_bubble(), rx.fragment()),
         status_line(),
         rx.cond(State.has_pending, pending_bar(), rx.fragment()),
+        rx.cond(State.has_question, question_bar(), rx.fragment()),
         id="chat-scroll",
         on_mount=rx.call_script(SCROLL_SETUP_JS),
         class_name="w-full max-w-2xl mx-auto flex-1 overflow-y-auto px-4 py-6 gap-3",

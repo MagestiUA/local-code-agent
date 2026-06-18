@@ -29,6 +29,7 @@ class Session:
     plan_first: bool = False                              # завжди планувати наперед
     reference_files: list = field(default_factory=list)   # read-only джерела (абс. шляхи)
     pending_plan: dict | None = None                      # план, що очікує виконання
+    pending_question: dict | None = None                  # питання планувальника, що очікує відповіді
     messages: list = field(default_factory=list)          # [{role, content, kind, meta}]
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
@@ -58,6 +59,14 @@ class Session:
 
     def clear_pending_plan(self) -> None:
         self.pending_plan = None
+        self.updated = time.time()
+
+    def set_pending_question(self, q: dict) -> None:
+        self.pending_question = q
+        self.updated = time.time()
+
+    def clear_pending_question(self) -> None:
+        self.pending_question = None
         self.updated = time.time()
 
 
