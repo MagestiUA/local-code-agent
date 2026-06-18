@@ -23,6 +23,7 @@ SYSTEM = (
     "- To create a small brand-new file from scratch: call write_file (path, content) — "
     "always pass a non-empty path that points to a FILE, not a folder.\n"
     "- To inspect: list_dir, read_file. To run programs (python/pytest/git): run_shell.\n"
+    "- To look up current/external info online (docs, errors): web_search.\n"
     "Use the file tools for file operations, not shell cmdlets. When the step is done, "
     "reply with a SHORT confirmation and NO tool call. Reply in the user's language."
 )

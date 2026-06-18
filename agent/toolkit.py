@@ -144,6 +144,13 @@ def h_create_from_source(args, ctx):
     return _apply_or_reject(res, target, ctx, "створено")
 
 
+def h_web_search(args, ctx):
+    from . import websearch
+    res = websearch.search(args.get("query", ""),
+                           int(args.get("max_results", websearch.DEFAULT_MAX) or websearch.DEFAULT_MAX))
+    return websearch.format_results(res)
+
+
 def default_registry() -> ToolRegistry:
     r = ToolRegistry()
     r.register(Tool("list_dir", "Показати структуру файлів проєкту.",
@@ -171,4 +178,10 @@ def default_registry() -> ToolRegistry:
                      "instruction": {"type": "string",
                                      "description": "що змінити; '' якщо просто копія"}},
                     ["target", "source", "instruction"], h_create_from_source))
+    r.register(Tool("web_search",
+                    "Пошук в інтернеті актуальної/зовнішньої інформації (документація, "
+                    "помилки, новини). Повертає короткі сніпети (заголовок, URL, опис).",
+                    {"query": {"type": "string", "description": "пошуковий запит"},
+                     "max_results": {"type": "integer", "description": "скільки результатів, типово 5"}},
+                    ["query"], h_web_search))
     return r
