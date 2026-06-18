@@ -54,12 +54,20 @@ def build_context(root: str | Path, reference_files=(), question: str = "",
     return "\n\n".join(parts)
 
 
+def _answer_messages(question: str, context: str) -> list[dict]:
+    user = (f"Контекст:\n{context}\n\n" if context else "") + f"Питання:\n{question}"
+    return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
+
+
 def answer(question: str, context: str = "", client: OllamaClient | None = None) -> tuple[str, str]:
     """Повертає (відповідь, роздуми). Роздуми (think on) — для згортання в UI."""
     client = client or OllamaClient()
-    user = (f"Контекст:\n{context}\n\n" if context else "") + f"Питання:\n{question}"
-    msg = client.chat(
-        [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
-        profile=config.PLANNER,
-    )
+    msg = client.chat(_answer_messages(question, context), profile=config.PLANNER)
     return (msg.get("content") or "").strip(), (msg.get("thinking") or "").strip()
+
+
+def answer_stream(question: str, context: str = "", client: OllamaClient | None = None):
+    """Стрімова версія answer(): генератор подій llm.chat_stream (PLANNER, think on).
+    Дельти content/thinking + фінальний done зі stats (для живого лічильника)."""
+    client = client or OllamaClient()
+    yield from client.chat_stream(_answer_messages(question, context), profile=config.PLANNER)

@@ -6,13 +6,14 @@ G3: керування сесіями через бекенд (agent/session.py)
 """
 import asyncio
 import threading
+import time
 from pathlib import Path
 
 import reflex as rx
 
 from agent import session as sess
 from agent.agent_loop import run_step
-from agent.answerer import answer, build_context
+from agent.answerer import answer_stream, build_context
 from agent.intent import classify_intent
 from agent.llm import OllamaClient
 from agent.memory import render_for_planner
@@ -60,6 +61,13 @@ class State(rx.State):
     confirm_text: str = ""
     _confirm_event: object = None     # threading.Event — бекенд-поле, не серіалізується
     _confirm_holder: object = None    # dict {"ok": bool} — результат кліку
+    # живий стрім (#1): оновлюється по ходу роздумів/відповіді
+    streaming: bool = False
+    stream_content: str = ""
+    stream_thinking: str = ""
+    stream_prompt_tokens: int = 0
+    stream_out_tokens: int = 0
+    stream_tps: float = 0.0
 
     @rx.event
     def set_task(self, v: str):
@@ -297,6 +305,49 @@ class State(rx.State):
             self._append("assistant", content, "step", thinking=log_md)
         return final, log
 
+    async def _stream_answer(self, text: str, ctx: str, client):
+        """Стрімить відповідь (answer-режим) з живим лічильником токенів + tok/s.
+        Блокуючий генератор тягнемо по чанку через to_thread, щоб цикл лишався
+        живим; кожен чанк оновлює stream_*; у фіналі — точні stats із метаданих."""
+        async with self:
+            self.streaming = True
+            self.stream_content = ""
+            self.stream_thinking = ""
+            self.stream_prompt_tokens = 0
+            self.stream_out_tokens = 0
+            self.stream_tps = 0.0
+            self.status = ""
+        gen = answer_stream(text, ctx, client)
+        t0 = time.time()
+        stats = None
+        while True:
+            ev = await asyncio.to_thread(lambda g=gen: next(g, None))
+            if ev is None:
+                break
+            if ev["done"]:
+                stats = ev.get("stats")
+                break
+            async with self:
+                self.stream_content += ev["content"]
+                self.stream_thinking += ev["thinking"]
+                if ev["content"]:                       # рахуємо лише токени виводу
+                    self.stream_out_tokens += 1
+                    el = time.time() - t0
+                    if el > 0:
+                        self.stream_tps = round(self.stream_out_tokens / el, 1)
+        async with self:
+            if stats:                                    # замінюємо приблизне точним
+                self.stream_prompt_tokens = stats.get("prompt", 0)
+                self.stream_out_tokens = stats.get("out", self.stream_out_tokens)
+                ns = stats.get("eval_ns", 0)
+                if ns:
+                    self.stream_tps = round(self.stream_out_tokens / (ns / 1e9), 1)
+            meta = (f"`↑{self.stream_prompt_tokens} ctx · ↓{self.stream_out_tokens} out "
+                    f"· {self.stream_tps} tok/s`")
+            body = (self.stream_content or "").strip() + "\n\n" + meta
+            self._append("assistant", body, "answer", thinking=self.stream_thinking)
+            self.streaming = False
+
     @rx.event(background=True)
     async def send_task(self, form_data: dict | None = None):
         async with self:
@@ -323,9 +374,7 @@ class State(rx.State):
             async with self:
                 self.status = "Аналізую код…"
             ctx = await asyncio.to_thread(lambda: build_context(root, refs, text))
-            content, thinking = await asyncio.to_thread(lambda: answer(text, ctx, client))
-            async with self:
-                self._append("assistant", content, "answer", thinking)
+            await self._stream_answer(text, ctx, client)
 
         elif mode == "shell":
             async with self:
@@ -630,7 +679,7 @@ def pending_bar() -> rx.Component:
 
 def status_line() -> rx.Component:
     return rx.cond(
-        State.busy,
+        State.busy & ~State.streaming,
         rx.hstack(
             rx.spinner(size="1"),
             rx.text(State.status, class_name="text-sm text-gray-400 italic"),
@@ -640,9 +689,39 @@ def status_line() -> rx.Component:
     )
 
 
+def streaming_bubble() -> rx.Component:
+    """Тимчасова бульбашка під час стріму: роздуми під катом + контент + живий
+    лічильник токенів/швидкості, що оновлюється по ходу генерації."""
+    return rx.box(
+        rx.cond(
+            State.stream_thinking != "",
+            rx.el.details(
+                rx.el.summary("Роздуми моделі",
+                              class_name="text-xs text-gray-500 cursor-pointer select-none"),
+                rx.markdown(State.stream_thinking),
+                class_name="mb-2 border-l-2 border-white/10 pl-2 max-h-80 overflow-y-auto",
+                open=True,
+            ),
+            rx.fragment(),
+        ),
+        rx.markdown(State.stream_content),
+        rx.hstack(
+            rx.spinner(size="1"),
+            rx.text(
+                "↑" + State.stream_prompt_tokens.to_string() + " ctx · ↓"
+                + State.stream_out_tokens.to_string() + " out · "
+                + State.stream_tps.to_string() + " tok/s",
+                class_name="text-xs text-gray-500 font-mono"),
+            class_name="items-center gap-2 mt-1",
+        ),
+        class_name="self-start bg-white/[0.03] rounded-2xl px-4 py-2.5 max-w-[85%] text-sm",
+    )
+
+
 def chat_view() -> rx.Component:
     return rx.vstack(
         rx.foreach(State.messages, message_bubble),
+        rx.cond(State.streaming, streaming_bubble(), rx.fragment()),
         status_line(),
         rx.cond(State.has_pending, pending_bar(), rx.fragment()),
         class_name="w-full max-w-2xl mx-auto flex-1 overflow-y-auto px-4 py-6 gap-3",

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 
@@ -12,10 +13,26 @@ import requests
 from . import config
 
 
+def _stream_event(obj: dict) -> dict:
+    """Нормалізувати один JSON-чанк потоку /api/chat у подію.
+    Проміжний чанк -> дельта content/thinking; фінальний (done) -> stats+tool_calls.
+    stats: prompt (токени контексту), out (токени виводу), eval_ns (час генерації, нс)."""
+    msg = obj.get("message", {}) or {}
+    if obj.get("done"):
+        return {"content": "", "thinking": "", "done": True,
+                "tool_calls": msg.get("tool_calls"),
+                "stats": {"prompt": obj.get("prompt_eval_count", 0) or 0,
+                          "out": obj.get("eval_count", 0) or 0,
+                          "eval_ns": obj.get("eval_duration", 0) or 0}}
+    return {"content": msg.get("content", "") or "",
+            "thinking": msg.get("thinking", "") or "", "done": False}
+
+
 class OllamaClient:
     def __init__(self, model: str = config.MODEL, host: str = config.HOST):
         self.model = model
         self.host = host.rstrip("/")
+        self.last_stats: dict = {}      # stats останнього chat() — для лічильника токенів
         self._ensure_server()
 
     # ── Сервер ──────────────────────────────────────────────────────────────
@@ -71,4 +88,42 @@ class OllamaClient:
         r = requests.post(f"{self.host}/api/chat", json=payload,
                           timeout=config.REQUEST_TIMEOUT)
         r.raise_for_status()
-        return r.json()["message"]
+        data = r.json()
+        self.last_stats = {"prompt": data.get("prompt_eval_count", 0) or 0,
+                           "out": data.get("eval_count", 0) or 0,
+                           "eval_ns": data.get("eval_duration", 0) or 0}
+        return data["message"]
+
+    def chat_stream(self, messages: list[dict], tools: list | None = None,
+                    profile: dict = config.EXECUTOR, fmt: str | dict | None = None):
+        """Стрімовий виклик /api/chat. Генератор подій (див. _stream_event):
+        проміжні чанки -> дельти content/thinking; фінальний -> done зі stats.
+        Для прозових шляхів (answer / chat-режим / роздуми планувальника)."""
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "think": profile["think"],
+            "options": {
+                "temperature": profile["temperature"],
+                "num_ctx": profile["num_ctx"],
+            },
+        }
+        if tools:
+            payload["tools"] = tools
+        if fmt:
+            payload["format"] = fmt
+        with requests.post(f"{self.host}/api/chat", json=payload, stream=True,
+                           timeout=config.REQUEST_TIMEOUT) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                ev = _stream_event(obj)
+                if ev["done"]:
+                    self.last_stats = ev["stats"]
+                yield ev
