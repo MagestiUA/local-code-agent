@@ -11,6 +11,7 @@ from pathlib import Path
 
 import reflex as rx
 
+from agent import convo
 from agent import session as sess
 from agent.agent_loop import run_step
 from agent.answerer import answer_stream, build_context
@@ -72,6 +73,7 @@ class State(rx.State):
     task: str = ""
     messages: list[dict] = []
     has_pending: bool = False
+    context_summary: str = ""              # контекст-памʼять розмови (підсумок)
     # планувальник-діалог (#2+#5): питання/вибір, що очікує відповіді
     has_question: bool = False
     q_text: str = ""
@@ -165,6 +167,7 @@ class State(rx.State):
         self.references = list(s.reference_files)
         self.messages = [{"thinking": "", **m} for m in s.messages]
         self.has_pending = s.pending_plan is not None
+        self.context_summary = s.context_summary
         self._load_question(s.pending_question)
 
     def _load_question(self, q: dict | None):
@@ -246,6 +249,7 @@ class State(rx.State):
             self.messages = []
             self.references = []
             self.has_pending = False
+            self.context_summary = ""
             self._load_question(None)
         self.sessions = sess.list_sessions()
 
@@ -329,6 +333,7 @@ class State(rx.State):
             plan.set_result(step.id, "done" if log else "failed", final or "—")
         async with self:
             self._append("assistant", "Готово ✓", "note")
+        await self._update_summary(plan.task, render_for_planner(plan), client)
 
     def _exec_ctx(self, root: str, client) -> ToolContext:
         """ToolContext для виконання: edits=auto (план/запит уже схвалено),
@@ -338,14 +343,15 @@ class State(rx.State):
                            client=client,
                            confirm=self._make_confirm(asyncio.get_running_loop()))
 
-    async def _run_tool_step(self, step_text: str, ctx: ToolContext, title: str = ""):
+    async def _run_tool_step(self, step_text: str, ctx: ToolContext, title: str = "",
+                             context: str = ""):
         """Один прохід tool-loop. У чат додає ОДНЕ повідомлення на крок: видимий
         заголовок + короткий підсумок, а всі дії моделі (списки файлів, diff-и,
         вивід команд) ховає під кат «хід виконання» (kind=step). Повертає (final, log)."""
         actions: list[tuple[str, str]] = []   # (tool, result) — заповнює on_tool у потоці
         stats: list[dict] = []                # client.last_stats кожного виклику моделі
         final, log = await asyncio.to_thread(
-            lambda: run_step(step_text, ctx, ctx.client, stats_sink=stats,
+            lambda: run_step(step_text, ctx, ctx.client, context=context, stats_sink=stats,
                              on_tool=lambda n, a, r: actions.append((n, r))))
 
         parts: list[str] = []
@@ -406,6 +412,23 @@ class State(rx.State):
             body = (self.stream_content or "").strip()
             self._append("assistant", body, "answer", thinking=self.stream_thinking)
             self.streaming = False
+        return body
+
+    async def _update_summary(self, user_text: str, outcome: str, client):
+        """Оновити контекст-памʼять розмови (LLM-підсумок) після завершеного запиту."""
+        if not (outcome or "").strip():
+            return
+        async with self:
+            cur = self.context_summary
+            self.status = "Оновлюю контекст…"
+        new = await asyncio.to_thread(
+            lambda: convo.update_summary(cur, user_text, outcome, client))
+        async with self:
+            self.context_summary = new
+            if self.current_id:
+                s = sess.load_session(self.current_id)
+                s.context_summary = new
+                sess.save_session(s)
 
     @rx.event(background=True)
     async def send_task(self, form_data: dict | None = None):
@@ -425,6 +448,7 @@ class State(rx.State):
             root = self.project_root
             refs = [str(x) for x in self.references]
             plan_first = self.plan_first or self.edits == "ask"
+            summary = self.context_summary         # контекст-памʼять для цього запиту
             answering = self.has_question          # вписана відповідь на питання планувальника
             if answering:
                 self.has_question = False
@@ -442,18 +466,22 @@ class State(rx.State):
                 async with self:
                     self.status = "Аналізую код…"
                 ctx = await asyncio.to_thread(lambda: build_context(root, refs, text))
-                await self._stream_answer(text, ctx, client)
+                ctx = convo.as_context(summary) + ctx
+                body = await self._stream_answer(text, ctx, client)
+                await self._update_summary(text, body, client)
             elif mode == "shell":
                 async with self:
                     self.status = "Виконую запит…"
                 ctx = self._exec_ctx(root, client)
-                await self._run_tool_step(text, ctx)
+                final, _ = await self._run_tool_step(text, ctx, context=convo.as_context(summary))
+                await self._update_summary(text, final or "виконано дії інструментами", client)
             else:  # plan / edit -> планувальник-діалог
                 async with self:
                     self.status = "Обмірковую план…"
                 doc = await asyncio.to_thread(lambda: load_project_doc(root))
                 struct = await asyncio.to_thread(lambda: scan_structure(root))
-                await self._deliberate_flow(text, struct, doc, [], root, plan_first, client)
+                context = convo.as_context(summary) + struct
+                await self._deliberate_flow(text, context, doc, [], root, plan_first, client)
 
         async with self:
             self.busy = False

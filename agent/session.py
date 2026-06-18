@@ -30,6 +30,7 @@ class Session:
     reference_files: list = field(default_factory=list)   # read-only джерела (абс. шляхи)
     pending_plan: dict | None = None                      # план, що очікує виконання
     pending_question: dict | None = None                  # питання планувальника, що очікує відповіді
+    context_summary: str = ""                             # стислий підсумок розмови (контекст-памʼять)
     messages: list = field(default_factory=list)          # [{role, content, kind, meta}]
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
