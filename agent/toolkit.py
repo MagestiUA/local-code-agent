@@ -24,6 +24,7 @@ class ToolContext:
     client: object = None
     confirm: Callable | None = None     # (text) -> bool
     attachments: list = field(default_factory=list)   # метадані вкладень (без вмісту)
+    attachments_dir: Path | None = None  # тека з файлами вкладень сесії (для read_attachment)
 
 
 @dataclass
@@ -87,6 +88,32 @@ def h_read_file(args, ctx):
                 "вручну — для дублювання у новий файл клич create_from_source, для зміни на "
                 "місці — edit_file (вони зберігають великі дані-літерали байт-у-байт).")
     return text
+
+
+def h_read_attachment(args, ctx):
+    """Прочитати прикріплений користувачем файл за іменем (нечіткий пошук у теці
+    вкладень сесії). Прощає неточності в довгому імені — exact → ci → підрядок."""
+    d = ctx.attachments_dir
+    if not d or not Path(d).is_dir():
+        return "немає прикріплених файлів"
+    files = [p for p in Path(d).iterdir() if p.is_file()]
+    if not files:
+        return "немає прикріплених файлів"
+    q = Path((args.get("name") or "").strip()).name      # лише базове ім'я
+    match = next((p for p in files if p.name == q), None)
+    if not match and q:
+        ql = q.lower()
+        cand = ([p for p in files if p.name.lower() == ql]
+                or [p for p in files if ql in p.name.lower()]
+                or [p for p in files if p.name.lower() in ql])
+        match = cand[0] if cand else None
+    if not match:
+        names = ", ".join(p.name for p in files)
+        return f"файл '{q}' не знайдено серед вкладень. Доступні: {names}"
+    text = T.read_file(match)
+    if len(text) > 8000:
+        text = text[:8000] + f"\n\n…[обрізано: показано 8000 з {len(text)} символів]"
+    return f"=== {match.name} ===\n{text}"
 
 
 def h_write_file(args, ctx):
@@ -167,6 +194,12 @@ def default_registry() -> ToolRegistry:
                     [], h_list_dir))
     r.register(Tool("read_file", "Прочитати вміст файлу.",
                     {"path": {"type": "string"}}, ["path"], h_read_file))
+    r.register(Tool("read_attachment",
+                    "Прочитати файл, ПРИКРІПЛЕНИЙ користувачем до повідомлення. Передай "
+                    "ім'я файлу зі списку прикріплених (можна частину імені — пошук "
+                    "нечіткий). Використовуй ЦЕ замість read_file для вкладень.",
+                    {"name": {"type": "string", "description": "ім'я прикріпленого файлу"}},
+                    ["name"], h_read_attachment))
     r.register(Tool("write_file",
                     "Створити або перезаписати файл із заданим вмістом. "
                     "Батьківські директорії створюються АВТОМАТИЧНО — не потрібно окремо "

@@ -1,24 +1,34 @@
 """Обробка файлів, прикріплених користувачем до повідомлення.
 
-Архітектура (map-reduce):
-  1. Користувач прикріплює файли → зберігаються як метадані + вміст (модуль-рівень).
-  2. Планувальник бачить ТІЛЬКИ імена і розміри → складає план (кожен файл = крок).
-  3. Виконавець кроку отримує вміст ОДНОГО файлу через format_single().
-  4. Reduce: планувальник зшиває результати кроків.
+Архітектура (файли на диску):
+  1. Користувач прикріплює файли → валідуються (classify/process) і ЗБЕРІГАЮТЬСЯ
+     на диск у теці сесії: ~/.local-code-agent/attachments/<session_id>/.
+  2. Моделі в контекст передається лише ШЛЯХ до теки + список імен (attachments_note),
+     БЕЗ вмісту. Модель сама читає потрібні файли через тул read_file/list_dir.
+  3. Чистка — ручна (видалення чіпа = видалення файлу з диска); тека сесії живе,
+     поки користувач її не прибере.
 
-classify()        — текст чи бінар.
-process()         — декодування + обрізання до бюджету.
-format_single()   — блок одного файлу для виконавця кроку.
-find_for_step()   — чи згадується якийсь файл у описі кроку.
-attachment_summary() — короткий список імен/розмірів для планувальника.
+classify()           — текст чи бінар.
+process()            — декодування + обрізання до бюджету (вміст у `_content`).
+session_dir()        — тека вкладень сесії на диску.
+save()/remove()/clear()/rename_session() — операції з файлами на диску.
+list_saved()         — метадані файлів, що вже лежать у теці (для відновлення chips).
+attachments_note()   — шлях до теки + список повних шляхів для контексту моделі.
 """
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 MAX_FILE_SIZE = 200 * 1024      # 200 KB — ліміт розміру одного файлу
 MAX_FILES = 20                  # максимальна кількість вкладень
-CHAR_BUDGET = 12_000            # символів на один файл у промпті виконавця
+CHAR_BUDGET = 12_000            # символів на один файл (обрізання при збереженні)
+
+# Тека вкладень — у корені репозиторію (.attachments/<sid>/), щоб файли було легко
+# знайти. attachments.py лежить у <repo>/agent/, тож корінь = parent.parent.
+# Ім'я з крапкою — щоб Reflex dev-watcher НЕ робив hot-reload при записі файлів сюди
+# (is_excluded_by_default виключає теки на "."); на Windows тека все одно видима.
+ATTACHMENTS_ROOT = Path(__file__).resolve().parent.parent / ".attachments"
 
 TEXT_EXTENSIONS = {
     ".py", ".pyw", ".pyi",
@@ -46,9 +56,10 @@ def classify(filename: str, data: bytes) -> str:
 
 
 def process(filename: str, data: bytes) -> dict:
-    """Обробити завантажений файл.
-    Повертає dict: {name, size, truncated, error}. Вміст НЕ зберігається тут —
-    він кладеться окремо в _ATTACHMENT_CONTENT[session_id][name] (lca_web.py).
+    """Валідувати й декодувати завантажений файл.
+    Повертає dict: {name, size, truncated, error, _content}. Поле `_content`
+    (обрізаний до CHAR_BUDGET текст) caller дістає й пише на диск через save();
+    при помилці (`error` != "") поля `_content` немає.
     """
     size = len(data)
     if size > MAX_FILE_SIZE:
@@ -64,31 +75,72 @@ def process(filename: str, data: bytes) -> dict:
             "error": "", "_content": content[:CHAR_BUDGET]}
 
 
-def format_single(name: str, content: str, truncated: bool = False) -> str:
-    """Форматувати вміст одного файлу для виконавця одного кроку."""
-    note = " [обрізано]" if truncated else ""
-    return f"\n=== Вміст файлу: {name}{note} ===\n{content}\n=== Кінець {name} ===\n"
+def _safe_name(name: str) -> str:
+    """Тільки базове ім'я файлу — захист від traversal (../, абсолютні шляхи)."""
+    return Path(name).name
 
 
-def find_for_step(step_description: str, meta_list: list[dict]) -> str | None:
-    """Повернути ім'я файлу якщо він згадується в описі кроку, інакше None."""
-    low = step_description.lower()
-    for a in meta_list:
-        if a.get("error"):
-            continue
-        if a["name"].lower() in low:
-            return a["name"]
-    return None
+def session_dir(session_id: str) -> Path:
+    """Тека вкладень для сесії на диску."""
+    return ATTACHMENTS_ROOT / session_id
 
 
-def attachment_summary(meta_list: list[dict]) -> str:
-    """Короткий список вкладень для планувальника (імена + розміри, БЕЗ вмісту)."""
-    if not meta_list:
+def save(session_id: str, name: str, content: str) -> Path:
+    """Зберегти текстовий вміст файлу в теку сесії. Повертає шлях до файлу."""
+    d = session_dir(session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / _safe_name(name)
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+def remove(session_id: str, name: str) -> None:
+    """Видалити один файл вкладення з диска (ручна чистка користувачем)."""
+    try:
+        (session_dir(session_id) / _safe_name(name)).unlink()
+    except OSError:
+        pass
+
+
+def clear(session_id: str) -> None:
+    """Видалити всю теку вкладень сесії (напр. при видаленні чату)."""
+    shutil.rmtree(session_dir(session_id), ignore_errors=True)
+
+
+def rename_session(old_id: str, new_id: str) -> None:
+    """Перенести теку вкладень old_id → new_id (міграція пре-сесійного `_tmp`)."""
+    src = session_dir(old_id)
+    if not src.is_dir():
+        return
+    dst = session_dir(new_id)
+    if dst.exists():
+        for f in src.iterdir():                 # злити: перенести файли
+            f.replace(dst / f.name)
+        shutil.rmtree(src, ignore_errors=True)
+    else:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.replace(dst)
+
+
+def list_saved(session_id: str) -> list[dict]:
+    """Метадані файлів, що лежать у теці сесії (для відновлення chips при виборі сесії).
+    На диску лежать лише валідні текстові файли, тож error завжди ''."""
+    d = session_dir(session_id)
+    if not d.is_dir():
+        return []
+    return [{"name": p.name, "size": p.stat().st_size, "truncated": False, "error": ""}
+            for p in sorted(d.iterdir()) if p.is_file()]
+
+
+def attachments_note(session_id: str, meta_list: list[dict]) -> str:
+    """Контекстний блок для моделі: імена прикріплених файлів (БЕЗ вмісту). Модель
+    читає потрібні через тул read_attachment(name) — він знаходить файл за іменем у
+    теці сесії (нечіткий пошук), тож копіювати довгі шляхи не треба."""
+    files = [a for a in meta_list if not a.get("error")]
+    if not files:
         return ""
-    lines = []
-    for a in meta_list:
-        kb = max(1, a["size"] // 1024)
-        note = f" [ПОМИЛКА: {a['error']}]" if a.get("error") else \
-               (" [обрізано]" if a.get("truncated") else "")
-        lines.append(f"  - {a['name']} ({kb} KB){note}")
-    return "Прикріплені файли:\n" + "\n".join(lines)
+    lines = [f"  - {a['name']}" for a in files]
+    return ("Користувач прикріпив до цієї розмови такі файли (доступні через тул). Щоб "
+            "побачити вміст — виклич read_attachment(name) з іменем файлу (можна кілька "
+            "викликів одним ходом). НЕ проси користувача надсилати їх ще раз — вони вже "
+            "є на диску й читаються тулом:\n" + "\n".join(lines))

@@ -1,10 +1,15 @@
-"""Офлайн-тест agent/attachments.py.
+"""Офлайн-тест agent/attachments.py (диск + метадані).
 Запуск: .venv\\Scripts\\python.exe -m tests.test_attachments
 """
+import shutil
+
 from agent.attachments import (
-    classify, process, format_single, find_for_step, attachment_summary,
-    CHAR_BUDGET, MAX_FILE_SIZE,
+    classify, process, session_dir, save, remove, clear, rename_session,
+    list_saved, attachments_note, CHAR_BUDGET, MAX_FILE_SIZE,
 )
+
+SID = "_test_session_xyz"
+SID2 = "_test_session_xyz2"
 
 
 def main():
@@ -20,53 +25,76 @@ def main():
     assert r["_content"] == "x = 1\n"
     assert not r["truncated"]
 
-    # process: завеликий
-    big = b"x" * (MAX_FILE_SIZE + 1)
-    r2 = process("big.txt", big)
-    assert r2["error"] != ""
-
-    # process: бінарний
+    # process: завеликий / бінарний → error, без _content
+    assert process("big.txt", b"x" * (MAX_FILE_SIZE + 1))["error"] != ""
     r3 = process("img.png", b"\x89PNG\r\n\x1a\n")
     assert r3["error"] != ""
+    assert "_content" not in r3
 
     # process: обрізання до CHAR_BUDGET
-    long_content = ("a" * (CHAR_BUDGET + 500)).encode()
-    r4 = process("long.py", long_content)
-    assert r4["error"] == ""
-    assert r4["truncated"]
+    r4 = process("long.py", ("a" * (CHAR_BUDGET + 500)).encode())
+    assert r4["error"] == "" and r4["truncated"]
     assert len(r4["_content"]) == CHAR_BUDGET
 
-    # format_single
-    out = format_single("a.py", "print(1)", truncated=False)
-    assert "a.py" in out
-    assert "print(1)" in out
-    assert "[обрізано]" not in out
+    # ── Диск: save / list_saved / remove / clear ──
+    clear(SID); clear(SID2)
+    try:
+        p = save(SID, "main.py", "print(1)\n")
+        assert p.is_file() and p.read_text(encoding="utf-8") == "print(1)\n"
+        assert p.parent == session_dir(SID)
+        save(SID, "utils.py", "x = 2\n")
 
-    out_trunc = format_single("a.py", "x", truncated=True)
-    assert "[обрізано]" in out_trunc
+        meta = list_saved(SID)
+        names = {m["name"] for m in meta}
+        assert names == {"main.py", "utils.py"}
+        assert all(m["error"] == "" for m in meta)
 
-    # find_for_step
-    meta = [
-        {"name": "main.py", "size": 100, "truncated": False, "error": ""},
-        {"name": "utils.py", "size": 200, "truncated": False, "error": ""},
-        {"name": "bad.bin", "size": 50, "truncated": False, "error": "бінарний"},
-    ]
-    assert find_for_step("Проаналізуй main.py і знайди баги", meta) == "main.py"
-    assert find_for_step("Відрефактори utils.py", meta) == "utils.py"
-    assert find_for_step("bad.bin треба виправити", meta) is None  # error → пропуск
-    assert find_for_step("Загальне завдання без файлів", meta) is None
+        # traversal-захист: лише базове ім'я
+        ev = save(SID, "../evil.py", "bad")
+        assert ev.parent == session_dir(SID) and ev.name == "evil.py"
+        remove(SID, "evil.py")
 
-    # attachment_summary
-    summary = attachment_summary(meta)
-    assert "main.py" in summary
-    assert "utils.py" in summary
-    assert "бінарний" in summary   # помилка відображається
-    assert "Прикріплені файли:" in summary
+        # attachments_note: імена файлів + інструкція read_attachment, без вмісту
+        note = attachments_note(SID, meta)
+        assert "main.py" in note and "utils.py" in note
+        assert "read_attachment" in note         # стеримо модель на правильний тул
+        assert "print(1)" not in note            # вмісту немає
+        assert attachments_note(SID, []) == ""
+        # error-файли не потрапляють у note
+        assert attachments_note(SID, [{"name": "x", "error": "бінарний"}]) == ""
 
-    assert attachment_summary([]) == ""
+        # remove одного файлу
+        remove(SID, "utils.py")
+        assert {m["name"] for m in list_saved(SID)} == {"main.py"}
 
-    print("OK: attachments — classify, process (обрізання, бінар, розмір), "
-          "format_single, find_for_step, attachment_summary")
+        # rename_session: міграція _tmp → реальна сесія
+        rename_session(SID, SID2)
+        assert not session_dir(SID).exists()
+        assert {m["name"] for m in list_saved(SID2)} == {"main.py"}
+
+        # list_saved на відсутній теці → []
+        assert list_saved("nope_nonexistent") == []
+
+        # read_attachment: нечіткий пошук за іменем у теці вкладень
+        from agent.toolkit import ToolContext, h_read_attachment
+        ctx = ToolContext(root=session_dir(SID2), attachments_dir=session_dir(SID2))
+        assert "print(1)" in h_read_attachment({"name": "main.py"}, ctx)   # exact
+        assert "print(1)" in h_read_attachment({"name": "MAIN.PY"}, ctx)   # case-insensitive
+        assert "print(1)" in h_read_attachment({"name": "main"}, ctx)      # підрядок
+        # повний шлях теж зводиться до базового імені
+        assert "print(1)" in h_read_attachment(
+            {"name": str(session_dir(SID2) / "main.py")}, ctx)
+        assert "не знайдено" in h_read_attachment({"name": "zzz.py"}, ctx)
+        # без attachments_dir → зрозуміле повідомлення
+        assert "немає" in h_read_attachment({"name": "x"}, ToolContext(root=session_dir(SID2)))
+    finally:
+        clear(SID); clear(SID2)
+
+    assert not session_dir(SID).exists()
+
+    print("OK: attachments — classify, process, save/list_saved/remove/clear, "
+          "rename_session, attachments_note, read_attachment (нечіткий пошук), "
+          "traversal-захист")
 
 
 if __name__ == "__main__":

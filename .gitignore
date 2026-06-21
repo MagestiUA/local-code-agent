@@ -13,3 +13,4 @@ __pycache__/
 _*.txt
 scratch/
 .agent/
+.attachments/
