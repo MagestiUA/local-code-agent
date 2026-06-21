@@ -10,13 +10,14 @@ import time
 from pathlib import Path
 
 import reflex as rx
-from reflex.components.radix.themes.color_mode import set_color_mode
+from reflex_base.style import set_color_mode
 
+from agent import attachments as A
 from agent import config
 from agent import convo
 from agent import session as sess
-from agent.agent_loop import run_step
-from agent.answerer import answer_stream, build_context
+from agent.agent_loop import _estimate_iters, run_step
+from agent.answerer import build_context
 from agent.intent import classify_intent
 from agent.llm import OllamaClient
 from agent.memory import render_for_planner
@@ -26,7 +27,10 @@ from agent.toolkit import ToolContext, default_registry
 
 CHAT_SYSTEM = (
     "You are a helpful thinking assistant. You can search the web with the web_search "
-    "tool when you need current or external information. Answer in the user's language."
+    "tool when you need current or external information. If the user attached files, "
+    "their names are listed in context — read any you need with the read_attachment(name) "
+    "tool (NEVER ask the user to paste or resend them; they are already available). "
+    "Answer in the user's language."
 )
 
 _CLIENT = None
@@ -38,9 +42,7 @@ _CONFIRMS: dict = {}
 # Stop-події для переривання стріму/виконання. Ключ — id сесії.
 _STOP_EVENTS: dict = {}
 
-# Вміст прикріплених файлів поза State (великі рядки не сериалізуємо).
-# {session_id: {filename: content_str}}
-_ATTACHMENT_CONTENT: dict = {}
+# Вкладення зберігаються на диску (agent/attachments.py), не в пам'яті.
 
 
 def get_client() -> OllamaClient:
@@ -52,18 +54,52 @@ def get_client() -> OllamaClient:
 
 SCROLL_SETUP_JS = """
 (() => {
+  // Виміряти ширину скролбара -> CSS-змінна (для вирівнювання поля вводу зі
+  // скрольованим чатом: чат втрачає ширину на скролбар, поле вводу — ні).
+  const sd = document.createElement('div');
+  sd.style.cssText = 'overflow:scroll;width:50px;height:50px;position:absolute;top:-9999px';
+  document.body.appendChild(sd);
+  document.documentElement.style.setProperty('--sbw', (sd.offsetWidth - sd.clientWidth) + 'px');
+  document.body.removeChild(sd);
+
   const c = document.getElementById('chat-scroll');
   if (!c || c._lcaObs) return;
   let stick = true;
   const nearBottom = () => c.scrollHeight - c.scrollTop - c.clientHeight < 120;
-  c.addEventListener('scroll', () => { stick = nearBottom(); });
-  const obs = new MutationObserver(() => { if (stick) c.scrollTop = c.scrollHeight; });
+  const btn = document.getElementById('scroll-down-btn');
+  const updBtn = () => { if (btn) btn.style.display = nearBottom() ? 'none' : 'inline-flex'; };
+  c.addEventListener('scroll', () => { stick = nearBottom(); updBtn(); });
+  const obs = new MutationObserver(() => { if (stick) c.scrollTop = c.scrollHeight; updBtn(); });
   obs.observe(c, {childList: true, subtree: true, characterData: true});
   c._lcaObs = obs;
   c.scrollTop = c.scrollHeight;
+  updBtn();
 })();
 """
 SCROLL_BOTTOM_JS = "var c=document.getElementById('chat-scroll'); if(c){c.scrollTop=c.scrollHeight;}"
+
+# Вставка файлів через Ctrl+V: перенаправляємо файли з буфера обміну у прихований
+# input компонента rx.upload → спрацьовує наявний handle_upload. Якщо у буфері лише
+# текст (files порожній) — нічого не робимо, звичайна вставка в textarea працює як є.
+PASTE_SETUP_JS = """
+(() => {
+  if (window._lcaPasteBound) return;
+  window._lcaPasteBound = true;
+  document.addEventListener('paste', (e) => {
+    const cd = e.clipboardData;
+    if (!cd) return;
+    const files = Array.from(cd.files || []);
+    if (!files.length) return;
+    const input = document.querySelector('.rx-Upload input[type="file"]');
+    if (!input) return;
+    e.preventDefault();
+    const dt = new DataTransfer();
+    files.forEach(f => dt.items.add(f));
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+})();
+"""
 
 
 BG = "#262624"
@@ -91,7 +127,8 @@ class State(rx.State):
     queued_text: str = ""                  # повідомлення, що чекає, поки модель зайнята
     stopping: bool = False                 # стоп запитано, чекаємо переривання
     context_summary: str = ""              # контекст-памʼять розмови (підсумок)
-    # Вкладення (#10) — тільки метадані, вміст у _ATTACHMENT_CONTENT
+    # Вкладення (#10) — лише метадані для chips; вміст файлів лежить на диску
+    # (agent/attachments.py, тека сесії). Модель читає їх через read_file.
     attachments: list[dict] = []
     # Налаштування (#9)
     settings_open: bool = False
@@ -188,13 +225,13 @@ class State(rx.State):
         """Чати поточного режиму (Чат/Код роздільні списки)."""
         return [s for s in self.sessions if s.get("kind", "code") == self.mode]
 
-    def _clear_attachments(self):
-        """Скинути вкладення поточного запиту: chips зі State + вміст із модуль-дикту."""
-        _ATTACHMENT_CONTENT.pop(self.current_id, None)
-        self.attachments = []
+    def _attachments_note(self) -> str:
+        """Контекстний блок для моделі: імена файлів сесії з ДИСКА (не зі стейджинг-чіпів,
+        бо ті зникають після відправки). Модель читає їх через read_attachment."""
+        return A.attachments_note(self.current_id, A.list_saved(self.current_id))
 
     def _clear_view(self):
-        _ATTACHMENT_CONTENT.pop(self.current_id, None)
+        # Файли вкладень лишаються на диску (ручна чистка) — скидаємо лише State-chips.
         self.current_id = ""
         self.title = ""
         self.project_root = ""
@@ -237,9 +274,10 @@ class State(rx.State):
         self.shell = s.permissions.get("shell", "smart")
         self.plan_first = s.plan_first
         self.references = list(s.reference_files)
-        self.messages = [{"thinking": "", **m} for m in s.messages]
+        self.messages = [{"thinking": "", "attachments": [], **m} for m in s.messages]
         self.has_pending = s.pending_plan is not None
         self.context_summary = s.context_summary
+        self.attachments = []     # чіпи — стейджинг до відправки; вкладення сесії на диску
         self._load_question(s.pending_question)
 
     def _load_question(self, q: dict | None):
@@ -255,12 +293,20 @@ class State(rx.State):
             self.q_reasoning = ""
             self.q_options = []
 
-    def _append(self, role: str, content: str, kind: str = "text", thinking: str = ""):
+    def _append(self, role: str, content: str, kind: str = "text", thinking: str = "",
+                attachments: list | None = None):
         self.messages = self.messages + [
-            {"role": role, "content": content, "kind": kind, "thinking": thinking}]
+            {"role": role, "content": content, "kind": kind, "thinking": thinking,
+             "attachments": attachments or []}]
         if self.current_id:
             s = sess.load_session(self.current_id)
-            s.messages = [dict(m) for m in self.messages]   # розгорнути Reflex-проксі
+            # Розгорнути Reflex-проксі, ВКЛЮЧНО з вкладеним списком attachments
+            # (інакше asdict() при збереженні падає на MutableProxy).
+            s.messages = [
+                {"role": m["role"], "content": m["content"],
+                 "kind": m.get("kind", "text"), "thinking": m.get("thinking", ""),
+                 "attachments": list(m.get("attachments", []) or [])}
+                for m in self.messages]
             sess.save_session(s)
 
     def _save_current(self):
@@ -350,18 +396,23 @@ class State(rx.State):
         self.theme = d["theme"]
         self.font_chat = d["font_chat"]
         self.font_ui = d["font_ui"]
-        # застосувати збережену тему + масштаб шрифту інтерфейсу на старті
-        return [set_color_mode(self.theme), rx.call_script(self.ui_font_js)]
+        # Тему застосовує next-themes сам (зберігає в localStorage між перезавантаженнями);
+        # set_color_mode НЕ можна викликати з бекенд-хендлера — лише шрифт через DOM.
+        # PASTE_SETUP_JS — одноразово вішає document-listener вставки файлів (Ctrl+V).
+        return [rx.call_script(self.ui_font_js), rx.call_script(PASTE_SETUP_JS)]
 
     def _save_settings(self):
         from agent import settings as S
         S.save({"theme": self.theme, "font_chat": self.font_chat, "font_ui": self.font_ui})
 
     @rx.event
-    def set_theme(self, v: str):
+    def set_theme(self, v: str | list[str]):
+        # Лише зберігаємо вибір; реальне перемикання робить set_color_mode,
+        # підвʼязаний до фронтенд-тригера сегмент-контролу (див. settings_dialog).
+        if isinstance(v, list):
+            v = v[0] if v else self.theme
         self.theme = v
         self._save_settings()
-        return set_color_mode(v)                    # реально перемкнути світлу/темну/авто
 
     @rx.event
     def set_font_chat(self, v: int):
@@ -377,25 +428,23 @@ class State(rx.State):
     # ── Вкладення (#10) ────────────────────────────────────────────────────────
     @rx.event
     async def handle_upload(self, files: list[rx.UploadFile]):
-        from agent.attachments import process, MAX_FILES
-        cid = self.current_id or "_tmp"
-        bucket = _ATTACHMENT_CONTENT.setdefault(cid, {})
+        cid = self.current_id or "_tmp"     # до створення сесії — у тимчасову теку _tmp
         for file in files:
-            if len(self.attachments) >= MAX_FILES:
+            if len(self.attachments) >= A.MAX_FILES:
                 break
             if any(a["name"] == file.filename for a in self.attachments):
                 continue                           # вже є — пропустити дублікат
             data = await file.read()
-            result = process(file.filename, data)
-            content = result.pop("_content", "")  # вміст окремо від metadata
-            if content:
-                bucket[file.filename] = content
+            result = A.process(file.filename, data)
+            content = result.pop("_content", "")  # вміст не тримаємо в State
+            if not result["error"] and content:
+                A.save(cid, file.filename, content)   # валідний → на диск
             self.attachments = self.attachments + [result]
 
     @rx.event
     def remove_attachment(self, name: str):
-        cid = self.current_id or "_tmp"
-        _ATTACHMENT_CONTENT.get(cid, {}).pop(name, None)
+        # Видалення чіпа = ручна чистка файлу з диска.
+        A.remove(self.current_id or "_tmp", name)
         self.attachments = [a for a in self.attachments if a["name"] != name]
 
     @rx.event
@@ -447,12 +496,10 @@ class State(rx.State):
 
         ToolContext: edits=auto (план уже схвалено — через plan_first або edits=auto).
         shell передаємо як є; для shell=ask confirm показує модальний попап."""
-        from agent.attachments import find_for_step, format_single
         ctx = self._exec_ctx(root, client)
         async with self:
-            att_meta = list(self.attachments)
             cid = self.current_id
-        att_bucket = _ATTACHMENT_CONTENT.get(cid, {})
+            att_note = self._attachments_note()    # шляхи файлів; виконавець читає read_file
         stop_ev = _STOP_EVENTS.get(cid)
         stopped = False
         for step in plan.steps:
@@ -467,19 +514,14 @@ class State(rx.State):
             step_ctx = f"Project root: {root}"
             if self.context_summary:
                 step_ctx += f"\n{convo.as_context(self.context_summary)}"
-            # Додаємо вміст одного файлу, якщо він згаданий у кроці (map-reduce)
-            fname = find_for_step(step.description, att_meta)
-            if fname and fname in att_bucket:
-                meta = next((a for a in att_meta if a["name"] == fname), {})
-                step_ctx += "\n" + format_single(fname, att_bucket[fname],
-                                                 meta.get("truncated", False))
+            if att_note:
+                step_ctx += "\n" + att_note
             final, log = await self._run_tool_step(step.description, ctx,
                                                    title=step.description[:60],
                                                    context=step_ctx, stop_event=stop_ev)
             plan.set_result(step.id, "done" if log else "failed", final or "—")
         async with self:
             self._append("assistant", "⛔ Зупинено" if stopped else "Готово ✓", "note")
-            self._clear_attachments()                  # вкладення спожиті/скинуті
         return render_for_planner(plan)               # outcome для фонового підсумку
 
     def _exec_ctx(self, root: str, client) -> ToolContext:
@@ -488,7 +530,8 @@ class State(rx.State):
         return ToolContext(root=Path(root),
                            permissions={"edits": "auto", "shell": self.shell},
                            client=client,
-                           confirm=self._make_confirm(asyncio.get_running_loop()))
+                           confirm=self._make_confirm(asyncio.get_running_loop()),
+                           attachments_dir=A.session_dir(self.current_id))
 
     async def _run_tool_step(self, step_text: str, ctx: ToolContext, title: str = "",
                              context: str = "", stop_event=None):
@@ -568,50 +611,157 @@ class State(rx.State):
             _STOP_EVENTS.pop(cid, None)
         return body, thinking, tool_calls
 
-    async def _stream_answer(self, text: str, ctx: str, client):
-        """Стрімить відповідь answer-режиму (без тулів)."""
-        body, thinking, _ = await self._run_stream(answer_stream(text, ctx, client))
+    # Тули, доступні read-only режимам (чат / answer): пошук + читання файлів/вкладень.
+    _READONLY_TOOLS = ("web_search", "read_file", "list_dir", "read_attachment")
+
+    async def _dispatch_tool_calls(self, tool_calls: list, msgs: list, reg, tctx):
+        """Виконати tool_calls: дописати результати в msgs + показати кроки в чаті."""
+        import json as _json
+        for call in tool_calls:
+            name = call.get("function", {}).get("name", "")
+            args = call.get("function", {}).get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = _json.loads(args)
+                except Exception:
+                    args = {}
+            label = args.get("name") or args.get("query") or args.get("path") or name
+            async with self:
+                self.status = f"{name}: {label}"[:60]
+            result = await asyncio.to_thread(lambda n=name, a=args: reg.dispatch(n, a, tctx))
+            msgs.append({"role": "tool", "content": result})
+            async with self:
+                self._append("assistant", f"🔧 {name} · {label}", "step", thinking=result)
+
+    async def _run_tool_chat(self, msgs: list, tctx: ToolContext, client,
+                             max_rounds: int = 6, gather_first: bool = False) -> str:
+        """Тул-цикл для read-only режимів.
+
+        gather_first=True (є прикріплені файли): фаза ЗБОРУ йде з think=OFF (EXECUTOR) —
+        gemma надійно емітить tool_calls (read_attachment), а не «думає» про них без
+        виклику; потім ОДИН фінальний синтез з think=ON (стрім, живий лічильник).
+
+        gather_first=False (простий чат/web_search): think=ON стрім-цикл як є; якщо
+        раунди вичерпано на тулах — форсований фінал без тулів."""
+        reg = default_registry()
+        tools = [t for t in reg.schema() if t["function"]["name"] in self._READONLY_TOOLS]
+
+        if gather_first:
+            for _ in range(max_rounds):
+                msg = await asyncio.to_thread(
+                    lambda: client.chat(msgs, tools=tools, profile=config.EXECUTOR))
+                tool_calls = msg.get("tool_calls") or []
+                if not tool_calls:
+                    break
+                msgs.append({"role": "assistant", "content": msg.get("content", ""),
+                             "tool_calls": tool_calls})
+                await self._dispatch_tool_calls(tool_calls, msgs, reg, tctx)
+            async with self:
+                self.status = "Формулюю відповідь…"
+            body, thinking, _ = await self._run_stream(
+                client.chat_stream(msgs, profile=config.PLANNER))
+            async with self:
+                self._append("assistant", body or "(порожня відповідь)", "answer",
+                             thinking=thinking)
+            return body
+
+        for _ in range(max_rounds):
+            body, thinking, tool_calls = await self._run_stream(
+                client.chat_stream(msgs, tools=tools, profile=config.PLANNER))
+            if not tool_calls:                       # модель завершила — це фінальна відповідь
+                async with self:
+                    self._append("assistant", body, "answer", thinking=thinking)
+                return body
+            msgs.append({"role": "assistant", "content": body, "tool_calls": tool_calls})
+            await self._dispatch_tool_calls(tool_calls, msgs, reg, tctx)
+        # Раунди вичерпано на викликах тулів → змушуємо модель відповісти зібраним (без тулів).
         async with self:
-            self._append("assistant", body, "answer", thinking=thinking)
+            self.status = "Формулюю відповідь…"
+        msgs.append({"role": "user",
+                     "content": "Достатньо читання. Дай повну відповідь українською за "
+                                "зібраними даними, більше не викликай тулів."})
+        body, thinking, _ = await self._run_stream(
+            client.chat_stream(msgs, profile=config.PLANNER))
+        async with self:
+            self._append("assistant", body or "(не вдалося сформувати відповідь)",
+                         "answer", thinking=thinking)
         return body
 
-    async def _chat_reply(self, text: str, client) -> str:
-        """Чат-режим: стрім думаючої моделі + web_search. Стрімимо з тулами; якщо у
-        фінальному чанку є tool_calls — виконуємо пошук, дописуємо й стрімимо далі."""
-        reg = default_registry()
-        ws = [t for t in reg.schema() if t["function"]["name"] == "web_search"]
-        tctx = ToolContext(root=Path.home(), permissions={"edits": "off", "shell": "off"})
+    async def _estimate_rounds(self, text: str, names: list, client) -> int:
+        """Адаптивний ліміт раундів тул-циклу. Коли є прикріплені файли — оцінюємо
+        через _estimate_iters (модель каже n тул-викликів → max(6, n*2)), щоб ліміт
+        масштабувався під кількість/складність файлів, а не впирався в хардкод. Без
+        файлів — дефолт 6 (ліміт усе одно не зв'язує простий чат: він завершується
+        першим раундом без тулів)."""
+        if not names:
+            return 6
+        return await asyncio.to_thread(
+            lambda: _estimate_iters(text, "files: " + "; ".join(names), client))
+
+    @staticmethod
+    def _inject_files(content: str, cur_names: list, other_names: list) -> str:
+        """Вшити в текст повідомлення ДВА переліки файлів, щоб модель зорієнтувалась:
+        - cur_names: прикріплені САМЕ до цього повідомлення → опрацювати;
+        - other_names: інші файли розмови → перечитати через read_attachment ЛИШЕ якщо
+          запит стосується саме їх (інакше вони вже в контексті через підсумок).
+        Усі читаються тулом read_attachment(name)."""
+        cur = [n for n in (cur_names or []) if n]
+        others = [n for n in (other_names or []) if n]
+        if not cur and not others:
+            return content
+        lines = ["[Доступні файли — читай тулом read_attachment(name):"]
+        if cur:
+            lines.append("• Додані до ЦЬОГО повідомлення (опрацюй): " + "; ".join(cur))
+        if others:
+            lines.append("• Інші файли розмови (перечитуй ЛИШЕ якщо запит саме про них): "
+                         + "; ".join(others))
+        return content + "\n\n" + "\n".join(lines) + "]"
+
+    async def _chat_reply(self, text: str, client, att_note: str = "") -> str:
+        """Чат-режим: думаюча модель + read-only тули. У поточну user-репліку вшиваємо
+        імена файлів, прикріплених САМЕ до неї (m['attachments']); модель читає їх через
+        read_attachment (attachments_dir = тека вкладень сесії)."""
         async with self:
+            cid = self.current_id
+            cur_atts = list(self.messages[-1].get("attachments", []) or []) if self.messages else []
             history = [{"role": m["role"], "content": m["content"]}
                        for m in self.messages
                        if m["role"] in ("user", "assistant")
                        and m.get("kind", "text") in ("text", "answer") and m["content"]][-20:]
+        all_names = [n["name"] for n in A.list_saved(cid)]
+        other_names = [n for n in all_names if n not in cur_atts]
+        # Вшити переліки файлів у ОСТАННЮ user-репліку (поточний хід), якщо файли є.
+        if all_names and history and history[-1]["role"] == "user":
+            history[-1] = {**history[-1],
+                           "content": self._inject_files(history[-1]["content"], cur_atts, other_names)}
+        tctx = ToolContext(root=A.session_dir(cid),
+                           permissions={"edits": "off", "shell": "off"}, client=client,
+                           attachments_dir=A.session_dir(cid))
         msgs = [{"role": "system", "content": CHAT_SYSTEM}] + history
-        body = ""
-        for _ in range(3):
-            body, thinking, tool_calls = await self._run_stream(
-                client.chat_stream(msgs, tools=ws, profile=config.PLANNER))
-            if not tool_calls:
-                async with self:
-                    self._append("assistant", body, "answer", thinking=thinking)
-                break
-            msgs.append({"role": "assistant", "content": body, "tool_calls": tool_calls})
-            for call in tool_calls:
-                args = call.get("function", {}).get("arguments", {})
-                if isinstance(args, str):
-                    import json as _json
-                    try:
-                        args = _json.loads(args)
-                    except Exception:
-                        args = {}
-                query = args.get("query", "")
-                async with self:
-                    self.status = f"Шукаю: {query}"
-                result = await asyncio.to_thread(lambda a=args: reg.dispatch("web_search", a, tctx))
-                msgs.append({"role": "tool", "content": result})
-                async with self:
-                    self._append("assistant", f"🔎 {query}", "step", thinking=result)
-        return body
+        rounds = await self._estimate_rounds(text, cur_atts or all_names, client)
+        # think=off-збір — лише коли є НОВІ вкладення (їх точно треба прочитати); старі
+        # за потреби модель дочитає в think=on-циклі (перелік їй видно).
+        return await self._run_tool_chat(msgs, tctx, client, rounds, gather_first=bool(cur_atts))
+
+    async def _answer_reply(self, text: str, ctx: str, att_note: str, root: str, client) -> str:
+        """Answer-режим (аналіз коду): думаюча модель + read-only тули. root = корінь
+        проєкту, тож модель читає і файли проєкту, і прикріплені (за повним шляхом)."""
+        from agent.answerer import SYSTEM as ANSWER_SYSTEM
+        async with self:
+            cid = self.current_id
+            cur_atts = list(self.messages[-1].get("attachments", []) or []) if self.messages else []
+        tctx = ToolContext(root=Path(root) if root else Path.home(),
+                           permissions={"edits": "off", "shell": "off"}, client=client,
+                           attachments_dir=A.session_dir(cid))
+        all_names = [n["name"] for n in A.list_saved(cid)]
+        other_names = [n for n in all_names if n not in cur_atts]
+        question = self._inject_files(text, cur_atts, other_names)
+        parts = [f"Контекст:\n{ctx}" if ctx else "", f"Питання:\n{question}"]
+        user = "\n\n".join(p for p in parts if p)
+        msgs = [{"role": "system", "content": ANSWER_SYSTEM},
+                {"role": "user", "content": user}]
+        rounds = await self._estimate_rounds(text, cur_atts or all_names, client)
+        return await self._run_tool_chat(msgs, tctx, client, rounds, gather_first=bool(cur_atts))
 
     async def _update_summary(self, user_text: str, outcome: str):
         """Оновлення контекст-памʼяті (LLM-підсумок) після завершеного запиту. Модель
@@ -660,9 +810,10 @@ class State(rx.State):
                 s = sess.new_session("Новий чат", "", kind=self.mode)
                 sess.save_session(s)
                 self.sessions = sess.list_sessions()
+                pre = list(self.attachments)            # chips, прикріплені до створення сесії
                 self._select(s.id)
-                if "_tmp" in _ATTACHMENT_CONTENT:       # перенести пре-сесійні вкладення
-                    _ATTACHMENT_CONTENT[s.id] = _ATTACHMENT_CONTENT.pop("_tmp")
+                A.rename_session("_tmp", s.id)          # перенести файли _tmp → сесія
+                self.attachments = pre                  # _select затер chips — повертаємо
             if self.mode != "chat" and not self.project_root:
                 self._append("assistant", "Спершу вкажіть робочу теку.", "note")
                 return
@@ -670,7 +821,11 @@ class State(rx.State):
             if not text:
                 return
             self.task = ""
-            self._append("user", text)
+            # Імена прикріплених файлів → у саме повідомлення (видно в чаті), потім
+            # стейджинг-чіпи прибираємо з-під інпута. Файли лишаються на диску.
+            att_names = [a["name"] for a in self.attachments if not a.get("error")]
+            self._append("user", text, attachments=att_names)
+            self.attachments = []
             if self.busy:                              # модель зайнята -> у чергу
                 self.queued_text = (self.queued_text + "\n\n" + text).strip() if self.queued_text else text
                 return
@@ -708,6 +863,7 @@ class State(rx.State):
             refs = [str(x) for x in self.references]
             plan_first = self.plan_first or self.edits == "ask"
             summary = self.context_summary
+            att_note = self._attachments_note()     # шляхи прикріплених файлів (модель читає сама)
             answering = self.has_question
             if answering:
                 self.has_question = False
@@ -719,7 +875,7 @@ class State(rx.State):
         su, so = text, ""
 
         if chat_mode:
-            so = await self._chat_reply(text, client)
+            so = await self._chat_reply(text, client, att_note)
         elif answering:
             su, so = await self._resume_planning(text, root, plan_first, client)
         else:
@@ -728,12 +884,15 @@ class State(rx.State):
                 async with self:
                     self.status = "Аналізую код…"
                 ctx = await asyncio.to_thread(lambda: build_context(root, refs, text))
-                so = await self._stream_answer(text, convo.as_context(summary) + ctx, client)
+                so = await self._answer_reply(text, convo.as_context(summary) + ctx,
+                                              att_note, root, client)
             elif mode == "shell":
                 async with self:
                     self.status = "Виконую запит…"
                 ctx = self._exec_ctx(root, client)
                 shell_ctx = f"Project root: {root}\n{convo.as_context(summary)}" if summary else f"Project root: {root}"
+                if att_note:
+                    shell_ctx += "\n" + att_note
                 final, _ = await self._run_tool_step(text, ctx, context=shell_ctx,
                                                      stop_event=_STOP_EVENTS.get(self.current_id))
                 so = final or "виконано дії інструментами"
@@ -749,10 +908,7 @@ class State(rx.State):
             async with self:
                 self.status = "Оновлюю памʼять…"
             await self._update_summary(su, so)
-        # Вкладення спожиті — чистимо, якщо запит не на паузі (план/уточнення триває)
-        async with self:
-            if not (self.has_pending or self.has_question):
-                self._clear_attachments()
+        # Файли вкладень лишаються на диску (ручна чистка) — нічого не скидаємо.
 
     @rx.event(background=True)
     async def answer_planner(self, value: str):
@@ -792,11 +948,9 @@ class State(rx.State):
         """Один хід планувальника-діалогу: clarify/choose -> питання+кнопки (пауза);
         plan -> готовий план (виконати або показати на підтвердження).
         Повертає (task, outcome) — outcome='' якщо пауза/не виконано (підсумок не потрібен)."""
-        from agent.attachments import attachment_summary
         async with self:
-            att_meta = list(self.attachments)
-        att_ctx = attachment_summary(att_meta)
-        full_context = (context + "\n\n" + att_ctx).strip() if att_ctx else context
+            att_note = self._attachments_note()
+        full_context = (context + "\n\n" + att_note).strip() if att_note else context
         result = await asyncio.to_thread(
             lambda: deliberate(task, full_context, client, doc, history))
         action = result["action"]
@@ -1006,7 +1160,10 @@ def settings_dialog() -> rx.Component:
                     rx.segmented_control.item("Темна", value="dark"),
                     rx.segmented_control.item("Авто", value="system"),
                     value=State.theme,
-                    on_change=State.set_theme,
+                    # set_color_mode мусить бути на фронтенд-тригері (інакше
+                    # setColorMode-хук не інжектиться → ReferenceError); State.set_theme
+                    # лише персистить вибір на диск.
+                    on_change=lambda v: [State.set_theme(v), set_color_mode(v)],
                     size="1", class_name="mb-4",
                 ),
                 # Шрифти
@@ -1101,14 +1258,18 @@ def _code_controls() -> rx.Component:
         ),
         rx.hstack(
             rx.text("консоль", class_name="text-xs text-gray-500"),
-            rx.select(
-                [rx.select.item("smart", value="smart"),
-                 rx.select.item("ask", value="ask"),
-                 rx.select.item("auto", value="auto"),
-                 rx.select.item("allowlist", value="allowlist"),
-                 rx.select.item("off", value="off")],
+            rx.select.root(
+                rx.select.trigger(variant="soft", width="6.2rem"),
+                rx.select.content(
+                    rx.select.item("smart", value="smart"),
+                    rx.select.item("ask", value="ask"),
+                    rx.select.item("auto", value="auto"),
+                    rx.select.item("allowlist", value="allowlist"),
+                    rx.select.item("off", value="off"),
+                ),
                 value=State.shell, on_change=State.set_shell,
-                size="1", variant="soft", width="6.2rem"),
+                size="1",
+            ),
             class_name="items-center gap-1",
         ),
         class_name="items-center gap-2",
@@ -1166,6 +1327,11 @@ def controls_bar() -> rx.Component:
                 "application/sql": [".sql"],
             },
             no_drag=True,
+            # Прибрати дефолтну рамку/padding rx.upload (вони задаються як ПРЯМІ
+            # props через setdefault, не через style) — лишити тільки іконку-кнопку.
+            border="none",
+            padding="0",
+            width="fit-content",
         ),
         rx.cond(State.is_chat, rx.fragment(), _code_controls()),
         rx.spacer(),
@@ -1261,11 +1427,11 @@ def input_box() -> rx.Component:
                 class_name="w-full rounded-2xl p-3 border " + BORDER,
                 style={"backgroundColor": INPUT},
             ),
-            class_name="w-full max-w-2xl gap-0",
+            class_name="w-full gap-0",      # ширину задає батьківський контейнер
         ),
         on_submit=State.send_task,
         reset_on_submit=False,
-        class_name="w-full flex justify-center",
+        class_name="w-full",
     )
 
 
@@ -1274,8 +1440,25 @@ def message_bubble(m: dict) -> rx.Component:
     return rx.box(
         rx.cond(
             mine,
-            rx.text(m["content"], class_name="whitespace-pre-wrap text-gray-100",
-                    style={"fontSize": State.chat_font_px}),
+            rx.vstack(
+                rx.text(m["content"], class_name="whitespace-pre-wrap text-gray-100",
+                        style={"fontSize": State.chat_font_px}),
+                rx.cond(
+                    m["attachments"].to(list[str]).length() > 0,
+                    rx.hstack(
+                        rx.foreach(
+                            m["attachments"].to(list[str]),
+                            lambda n: rx.hstack(
+                                rx.icon("file", size=11, class_name="text-gray-400"),
+                                rx.text(n, class_name="text-xs text-gray-300 truncate max-w-40"),
+                                class_name="items-center gap-1 px-2 py-0.5 rounded-full bg-black/20"),
+                        ),
+                        class_name="flex-wrap gap-1 mt-1 justify-end",
+                    ),
+                    rx.fragment(),
+                ),
+                class_name="items-end gap-0",
+            ),
             rx.box(
                 rx.cond(
                     m["thinking"] != "",
@@ -1292,8 +1475,12 @@ def message_bubble(m: dict) -> rx.Component:
                 style={"fontSize": State.chat_font_px},
             ),
         ),
-        class_name=rx.cond(mine, "self-end bg-white/10", "self-start bg-white/[0.03]")
-        + " rounded-2xl px-4 py-2.5 max-w-[85%]",
+        # user — компактна бульбашка справа; assistant — на всю ширину (вирівняно з полем вводу).
+        class_name=rx.cond(
+            mine,
+            "self-end bg-white/10 max-w-[85%]",
+            "self-start bg-white/[0.03] w-full",
+        ) + " rounded-2xl px-4 py-2.5",
     )
 
 
@@ -1365,7 +1552,8 @@ def streaming_bubble() -> rx.Component:
             rx.fragment(),
         ),
         rx.markdown(State.stream_content),
-        class_name="self-start bg-white/[0.03] rounded-2xl px-4 py-2.5 max-w-[85%] text-sm",
+        class_name="self-start bg-white/[0.03] rounded-2xl px-4 py-2.5 w-full",
+        style={"fontSize": State.chat_font_px},
     )
 
 
@@ -1378,19 +1566,24 @@ def chat_view() -> rx.Component:
         rx.cond(State.has_question, question_bar(), rx.fragment()),
         id="chat-scroll",
         on_mount=rx.call_script(SCROLL_SETUP_JS),
-        class_name="w-full max-w-2xl mx-auto flex-1 overflow-y-auto px-4 py-6 gap-3",
-        style={"fontSize": State.chat_font_px},
+        class_name="w-full flex-1 overflow-y-auto px-[1cm] py-6 gap-3",
+        # scrollbar-gutter: stable — скролбар завжди резервує місце праворуч, тож ширина
+        # контенту стабільна; поле вводу компенсує ту саму ширину через --sbw (нижче).
+        style={"fontSize": State.chat_font_px, "scrollbarGutter": "stable"},
     )
 
 
 def scroll_down_button() -> rx.Component:
-    """Кнопка-стрілка: промотати чат донизу."""
+    """Кнопка-стрілка: промотати чат донизу. По центру, над полем вводу."""
     return rx.button(
         rx.icon("arrow-down", size=18),
         on_click=rx.call_script(SCROLL_BOTTOM_JS),
         radius="full", size="2",
-        class_name="absolute bottom-4 right-4 bg-white/10 hover:bg-white/20 text-gray-100 "
-                   "shadow-lg backdrop-blur z-10",
+        id="scroll-down-btn",
+        # Початково сховано; SCROLL_SETUP_JS показує лише коли чат прокручено вгору.
+        style={"display": "none"},
+        class_name="absolute left-1/2 -translate-x-1/2 bottom-full mb-3 bg-white/10 "
+                   "hover:bg-white/20 text-gray-100 shadow-lg backdrop-blur z-10",
     )
 
 
@@ -1399,8 +1592,13 @@ def main_area() -> rx.Component:
         State.messages,
         rx.vstack(
             chat_view(),
-            scroll_down_button(),
-            rx.box(input_box(), class_name="w-full px-4 pb-4 flex justify-center"),
+            rx.box(
+                scroll_down_button(),
+                input_box(),
+                # Праворуч додаємо ширину скролбара (--sbw), щоб рамка поля вводу
+                # збігалася з правим краєм відповіді (чат має скролбар, інпут — ні).
+                class_name="w-full pl-[1cm] pr-[calc(1cm+var(--sbw,0px))] pb-4 relative",
+            ),
             class_name="flex-1 h-full w-full relative",
         ),
         rx.center(
@@ -1431,7 +1629,6 @@ def index() -> rx.Component:
 
 
 app = rx.App(
-    theme=rx.theme(appearance="dark"),
     stylesheets=["https://fonts.googleapis.com/css2?family=Newsreader:ital@0;1&display=swap"],
 )
 app.add_page(index, title="local-code-agent",
