@@ -739,14 +739,28 @@ class State(rx.State):
                            attachments_dir=A.session_dir(cid))
         msgs = [{"role": "system", "content": CHAT_SYSTEM}] + history
         rounds = await self._estimate_rounds(text, cur_atts or all_names, client)
-        # think=off-збір — лише коли є НОВІ вкладення (їх точно треба прочитати); старі
-        # за потреби модель дочитає в think=on-циклі (перелік їй видно).
-        return await self._run_tool_chat(msgs, tctx, client, rounds, gather_first=bool(cur_atts))
+        # think=off-збір, коли в сесії Є файли (нові чи старі) — щоб модель НАДІЙНО їх
+        # читала (think=on часто «думає» про read_attachment, але не викликає). Чистий
+        # чат без файлів → think=on-стрім без зайвого збору.
+        return await self._run_tool_chat(msgs, tctx, client, rounds, gather_first=bool(all_names))
+
+    # Системний промпт answer-режиму В ТУЛ-ЦИКЛІ: на відміну від answerer.SYSTEM, явно
+    # каже про read_file/list_dir — інакше модель «просить користувача прислати файли»
+    # замість того, щоб прочитати їх самій (той самий баг, що зупиняв аналіз після плану).
+    _ANSWER_TOOLS_SYSTEM = (
+        "You are a code analysis assistant for a local project. You have tools: "
+        "read_file(path) and list_dir(path) to inspect ANY file in the project, plus "
+        "web_search. The project structure is in the context. To answer ACCURATELY you "
+        "MUST read the relevant files yourself with read_file — NEVER ask the user to "
+        "paste or provide file contents, you can read them directly. Read the files you "
+        "need, then answer concisely, citing the file/function. Do NOT propose code edits "
+        "unless asked. Answer in the user's language."
+    )
 
     async def _answer_reply(self, text: str, ctx: str, att_note: str, root: str, client) -> str:
         """Answer-режим (аналіз коду): думаюча модель + read-only тули. root = корінь
         проєкту, тож модель читає і файли проєкту, і прикріплені (за повним шляхом)."""
-        from agent.answerer import SYSTEM as ANSWER_SYSTEM
+        ANSWER_SYSTEM = self._ANSWER_TOOLS_SYSTEM
         async with self:
             cid = self.current_id
             cur_atts = list(self.messages[-1].get("attachments", []) or []) if self.messages else []
@@ -761,7 +775,11 @@ class State(rx.State):
         msgs = [{"role": "system", "content": ANSWER_SYSTEM},
                 {"role": "user", "content": user}]
         rounds = await self._estimate_rounds(text, cur_atts or all_names, client)
-        return await self._run_tool_chat(msgs, tctx, client, rounds, gather_first=bool(cur_atts))
+        # answer-режим = аналіз коду: ЗАВЖДИ think=off-збір, щоб модель надійно читала
+        # файли проєкту (read_file/list_dir). Без цього вона лише «планує» прозою й
+        # зупиняється, нічого не прочитавши (саме той баг «стоп після планування»).
+        # Фінальний синтез усе одно think=on (у _run_tool_chat).
+        return await self._run_tool_chat(msgs, tctx, client, rounds, gather_first=True)
 
     async def _update_summary(self, user_text: str, outcome: str):
         """Оновлення контекст-памʼяті (LLM-підсумок) після завершеного запиту. Модель
