@@ -7,6 +7,7 @@ G3: керування сесіями через бекенд (agent/session.py)
 import asyncio
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import reflex as rx
@@ -16,7 +17,7 @@ from agent import attachments as A
 from agent import config
 from agent import convo
 from agent import session as sess
-from agent.agent_loop import _estimate_iters, run_step
+from agent.agent_loop import _estimate_iters
 from agent.answerer import build_context
 from agent.intent import classify_intent
 from agent.llm import OllamaClient
@@ -35,8 +36,8 @@ CHAT_SYSTEM = (
 
 _CLIENT = None
 
-# Очікувані confirm-и shell=ask, поза State (threading.Event непіклиться -> інакше
-# StateSerializationError). Ключ — id сесії. {sid: {"event": Event, "ok": bool}}
+# Очікувані confirm-и shell=ask, поза State (asyncio.Event не серіалізується). Ключ —
+# id сесії. {sid: {"event": asyncio.Event, "ok": bool}}. Резолвить confirm_yes/no.
 _CONFIRMS: dict = {}
 
 # Stop-події для переривання стріму/виконання. Ключ — id сесії.
@@ -467,28 +468,24 @@ class State(rx.State):
         self.references = [x for x in self.references if x != r]
         self._save_current()
 
-    def _make_confirm(self, loop):
-        """Збудувати confirm(text)->bool для shell=ask. Викликається із воркер-потоку
-        (asyncio.to_thread), тож показ діалогу планує корутину на головний цикл через
-        run_coroutine_threadsafe, а саме очікування — на threading.Event (блокує лише
-        воркер, не цикл). Event тримаємо в модульному _CONFIRMS (поза State — інакше
-        непіклиться). Закриття без відповіді неможливе (діалог керований кнопками);
-        таймаут 300с -> відмова, щоб воркер не завис назавжди."""
-        cid = self.current_id
-
-        def confirm(text: str) -> bool:
-            ev = threading.Event()
-            _CONFIRMS[cid] = {"event": ev, "ok": False}
-
-            async def _show():
-                async with self:
-                    self.confirm_text = text
-                    self.confirm_open = True
-
-            asyncio.run_coroutine_threadsafe(_show(), loop).result()
-            ev.wait(timeout=300)
-            return _CONFIRMS.pop(cid, {}).get("ok", False)
-        return confirm
+    async def _confirm_async(self, text: str) -> bool:
+        """Показати діалог підтвердження З КОНТЕКСТУ background-події (через `async with
+        self`, тож дельта confirm_open реально доходить до фронта — на відміну від
+        старого _show через run_coroutine_threadsafe, що не мав EventContext) і чекати
+        клік через asyncio.Event БЕЗ блокування воркер-потоку. Резолвиться
+        confirm_yes/confirm_no; таймаут 300с -> відмова."""
+        ev = asyncio.Event()
+        _CONFIRMS[self.current_id] = {"event": ev, "ok": False}
+        async with self:
+            self.confirm_text = text
+            self.confirm_open = True
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=300)
+        except asyncio.TimeoutError:
+            pass
+        async with self:
+            self.confirm_open = False
+        return _CONFIRMS.pop(self.current_id, {}).get("ok", False)
 
     async def _execute_steps(self, plan, root: str, client):
         """Виконати кроки плану через per-step tool-loop: модель сама обирає тули
@@ -525,25 +522,68 @@ class State(rx.State):
         return render_for_planner(plan)               # outcome для фонового підсумку
 
     def _exec_ctx(self, root: str, client) -> ToolContext:
-        """ToolContext для виконання: edits=auto (план/запит уже схвалено),
-        shell передаємо як є; для shell=ask confirm показує модальний попап."""
+        """ToolContext для виконання: edits=auto (план/запит уже схвалено). Підтвердження
+        shell тепер робить async-шар (_dispatch_tool/_confirm_async), тож confirm=None —
+        самі тули блокуючого попапу більше не викликають."""
         return ToolContext(root=Path(root),
                            permissions={"edits": "auto", "shell": self.shell},
-                           client=client,
-                           confirm=self._make_confirm(asyncio.get_running_loop()),
+                           client=client, confirm=None,
                            attachments_dir=A.session_dir(self.current_id))
+
+    async def _dispatch_tool(self, reg, name: str, args: dict, ctx: ToolContext) -> str:
+        """Виконати тул. run_shell, що потребує підтвердження (shell=ask, або smart+
+        небезпечна), ставимо на ASYNC-паузу з діалогом (без блокування воркера); решта —
+        у потоці. Схвалену команду виконуємо з shell=auto, щоб тул не питав удруге."""
+        if name == "run_shell":
+            from agent.shell_guard import classify
+            cmd = (args.get("command") or "").strip()
+            mode = ctx.permissions.get("shell", "allowlist")
+            if mode == "off":
+                return "консоль вимкнена (дозвіл shell=off)"
+            danger = mode == "smart" and classify(cmd) == "danger"
+            if mode == "ask" or danger:
+                prompt = f"⚠ Небезпечна команда:\n{cmd}" if danger else f"Виконати: {cmd}"
+                if not await self._confirm_async(prompt):
+                    return "команду відхилено користувачем"
+                ctx = replace(ctx, permissions={**ctx.permissions, "shell": "auto"})
+        return await asyncio.to_thread(lambda: reg.dispatch(name, args, ctx))
 
     async def _run_tool_step(self, step_text: str, ctx: ToolContext, title: str = "",
                              context: str = "", stop_event=None):
-        """Один прохід tool-loop. У чат додає ОДНЕ повідомлення на крок: видимий
-        заголовок + короткий підсумок, а всі дії моделі (списки файлів, diff-и,
-        вивід команд) ховає під кат «хід виконання» (kind=step). Повертає (final, log)."""
-        actions: list[tuple[str, str]] = []   # (tool, result) — заповнює on_tool у потоці
+        """Async per-step tool-loop: модель кличе тули, ми диспетчеримо їх (виклик моделі
+        — per-iteration через to_thread). run_shell, що потребує підтвердження, ставимо
+        на async-паузу — діалог показується з контексту ЦІЄЇ події (дельта доходить), а
+        не з відірваної корутини. Додає ОДНЕ повідомлення-крок із катом «хід виконання».
+        Логіку дублюємо з agent_loop.run_step (той лишається для headless/тестів)."""
+        from agent.agent_loop import SYSTEM as EXEC_SYSTEM, _args
+        reg = default_registry()
+        client = ctx.client
+        user = (f"Контекст:\n{context}\n\n" if context else "") + f"Крок:\n{step_text}"
+        messages = [{"role": "system", "content": EXEC_SYSTEM},
+                    {"role": "user", "content": user}]
+        max_iters = await asyncio.to_thread(lambda: _estimate_iters(step_text, context, client))
+        actions: list[tuple[str, str]] = []   # (tool, result)
         stats: list[dict] = []                # client.last_stats кожного виклику моделі
-        final, log = await asyncio.to_thread(
-            lambda: run_step(step_text, ctx, ctx.client, context=context, stats_sink=stats,
-                             on_tool=lambda n, a, r: actions.append((n, r)),
-                             stop_event=stop_event))
+        final = "досягнуто ліміту ітерацій"
+        for _ in range(max_iters):
+            if stop_event is not None and stop_event.is_set():
+                final = "зупинено користувачем"; break
+            msg = await asyncio.to_thread(
+                lambda: client.chat(messages, tools=reg.schema(), profile=config.EXECUTOR))
+            if client.last_stats:
+                stats.append(dict(client.last_stats))
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                final = (msg.get("content") or "").strip(); break
+            messages.append({"role": "assistant", "content": msg.get("content", ""),
+                             "tool_calls": calls})
+            for call in calls:
+                name = call.get("function", {}).get("name", "")
+                args = _args(call)
+                result = await self._dispatch_tool(reg, name, args, ctx)
+                actions.append((name, result))
+                messages.append({"role": "tool", "content": result})
+        log = [f"{n} -> {r[:80]}" for n, r in actions]
 
         parts: list[str] = []
         for name, result in actions:

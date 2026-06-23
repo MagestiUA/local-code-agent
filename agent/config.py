@@ -4,7 +4,7 @@
   EXECUTOR — механічне виконання: думання ВИМКНЕНО, увесь бюджет на код, швидко.
   PLANNER  — декомпозиція й аналіз: думання УВІМКНЕНО.
 
-num_ctx=65536 — заміряна солодка точка (≈107 t/s, майже все на GPU).
+num_ctx=128000 — заміряна солодка точка (≈107 t/s, майже все на GPU).
 Не варіюємо num_ctx між профілями — інакше Ollama перевантажує модель.
 """
 from __future__ import annotations
@@ -35,5 +35,5 @@ ALLOWED_SHELL = (
 SHELL_TIMEOUT = 120
 
 # Профілі ролей: (think, num_ctx, temperature)
-EXECUTOR = {"think": False, "num_ctx": 65536, "temperature": 0.2}
-PLANNER  = {"think": True,  "num_ctx": 65536, "temperature": 0.3}
+EXECUTOR = {"think": False, "num_ctx": 128000, "temperature": 0.2}
+PLANNER  = {"think": True,  "num_ctx": 128000, "temperature": 0.3}
