@@ -50,7 +50,20 @@ def main() -> None:
     # невідомий тул
     assert "невідомий" in reg.dispatch("nope", {}, ctx)
 
-    print("OK: реєстр — схема, read/write/list/run_shell, дозволи, захист write/read, невідомий тул")
+    # захист від path traversal: вихід за корінь (.. і абсолютний) заборонено
+    up = reg.dispatch("read_file", {"path": "../../../etc/passwd"}, ctx)
+    assert "поза межами" in up, up
+    out_abs = reg.dispatch("write_file",
+                           {"path": str(Path(tempfile.gettempdir()) / "lca_escape.txt"),
+                            "content": "x"}, ctx)
+    assert "поза межами" in out_abs, out_abs
+    assert not (Path(tempfile.gettempdir()) / "lca_escape.txt").exists()
+    # легітимні шляхи всередині кореня (зокрема через підтеку) — працюють
+    assert "записано" in reg.dispatch("write_file", {"path": "ok/nested.txt", "content": "z"}, ctx)
+    assert "a.py" in reg.dispatch("list_dir", {"path": "."}, ctx)
+
+    print("OK: реєстр — схема, read/write/list/run_shell, дозволи, захист write/read, "
+          "traversal-захист, невідомий тул")
     print(f"  інструменти: {reg.names()}")
 
 

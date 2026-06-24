@@ -30,6 +30,9 @@ SYSTEM = (
     "For venv pip use: '.venv\\Scripts\\pip install ...' (Windows) or '.venv/bin/pip install ...' (Linux). "
     "Do NOT use run_shell to create directories or copy files — use write_file instead.\n"
     "- web_search(query): look up docs, errors, external info.\n\n"
+    "If a run_shell command FAILS, read the error and issue a CORRECTED command — do "
+    "NOT repeat the same failing command. (E.g. git: stage with 'git add -A', then "
+    "commit with 'git commit -m \"message\"' — '-m' belongs to commit, NOT to add.)\n"
     "When the step is done, reply with a SHORT confirmation and NO tool call. "
     "Reply in the user's language."
 )
@@ -57,9 +60,12 @@ def _estimate_iters(step_text: str, context: str, client: OllamaClient) -> int:
             profile=config.EXECUTOR, fmt=_ESTIMATE_SCHEMA,
         )
         n = json.loads(msg.get("content") or "{}").get("n", 6)
-        return max(6, int(n) * 2)
+        # Запас на самокорекцію: слабка модель часто витрачає 2-3 ітерації на невдалі
+        # спроби (напр. плутає `git add -m` з `git commit -m`), тож множник і підлога
+        # вищі — інакше крок упирається в ліміт ще до завершення (як було з commit).
+        return max(10, int(n) * 3)
     except Exception:
-        return 12
+        return 15
 
 
 def _args(call: dict) -> dict:

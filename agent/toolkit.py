@@ -69,8 +69,16 @@ class ToolRegistry:
 
 # ── Обробники ────────────────────────────────────────────────────────────────
 def _resolve(ctx: ToolContext, path: str) -> Path:
+    """Резолвити шлях відносно кореня проєкту й боронити вихід за його межі
+    (traversal через `..` або абсолютний шлях). Без цього модель — особливо при
+    edits=auto — могла б читати/писати будь-де на диску (напр. ~/.ssh, поза проєктом).
+    Кидає ValueError; ToolRegistry.dispatch ловить його й віддає текст моделі."""
+    root = ctx.root.resolve()
     p = Path(path)
-    return p if p.is_absolute() else ctx.root / p
+    full = (p if p.is_absolute() else root / p).resolve()
+    if full != root and root not in full.parents:
+        raise ValueError(f"шлях поза межами проєкту заборонено: {path}")
+    return full
 
 
 def h_list_dir(args, ctx):

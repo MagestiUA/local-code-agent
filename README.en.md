@@ -37,13 +37,24 @@ a new one = register it, no loop rewrite. Built-in tools:
 | `edit_file` | refactor an existing `.py` (with strip/restore) |
 | `create_from_source` | create a NEW file as a copy of a source (with strip/restore) |
 | `run_shell` | run a program (python / pytest / git) |
+| `read_attachment` | read a user-attached file (fuzzy name match) |
+| `web_search` | web search (DuckDuckGo via `ddgs`, no key) |
+
+All file-tool paths are confined to the project root (traversal protection against
+`..` or absolute paths).
 
 ## Permissions
 
 - **edits** (`ask` / `auto`) — `ask` shows the plan and waits for approval;
   `auto` executes immediately.
-- **shell** (`allowlist` / `ask` / `off`) — `allowlist` permits only safe
-  commands; `ask` prompts (popup) before each command; `off` disables shell.
+- **shell** (`smart` / `ask` / `auto` / `allowlist` / `off`):
+  - `smart` (default) — safe commands run automatically; potentially destructive
+    ones (`rm -rf`, formatting, system dirs, etc. — see `shell_guard.py`) pause for
+    confirmation;
+  - `ask` — prompts (popup) before each command;
+  - `auto` — runs everything without asking;
+  - `allowlist` — only safe whitelisted prefixes;
+  - `off` — disables shell.
 
 ## Layout
 
@@ -62,11 +73,30 @@ agent/
   memory.py      task state on disk
   session.py     sessions/chats (project, permissions, history, sources)
   project.py     AGENT.md (project knowledge) + structure scan
+  convo.py       conversation context-memory (compact summary across turns)
+  attachments.py attachments on disk + read_attachment
+  shell_guard.py classifier of dangerous shell commands (smart mode)
+  websearch.py   web search (DuckDuckGo, pluggable provider)
+  settings.py    settings (theme, font sizes) on disk
 lca_web/
-  lca_web.py     web UI (Reflex, Claude-style)
+  lca_web.py     web UI (Reflex, Claude-style); Chat | Code modes
 main.py          entry point (convenient from PyCharm)
 rxconfig.py      Reflex config
 ```
+
+## Reliability under a weak model
+
+A few techniques keep the weak local model inside the working loop:
+
+- **DRY sampling** in the `EXECUTOR` profile — penalizes repeating whole
+  phrases/sequences (e.g. the same failing command over and over) without
+  damaging code the way a blunt `repeat_penalty` would.
+- **Tool-call nudge** — if the model narrates an intent instead of calling a tool,
+  the loop nudges it once to perform the step as an action.
+- **Plan context per step** — the step executor sees the overall task and sibling
+  steps, not just its bare step description.
+- **Strip/Restore** of large literals (see above) + `think=off` for structured
+  output (JSON plans don't get truncated by thinking).
 
 ## Project knowledge (AGENT.md)
 
@@ -77,7 +107,7 @@ auto-drafts `AGENT.md` for a new repo.
 
 ## Requirements
 
-- Python 3.12, `requests`, `reflex==0.9.5.post2`
+- Python 3.12, `requests`, `reflex==0.9.5.post2`, `ddgs` (web search)
 - Ollama with the `gemma4:26b-a4b-it-qat` model
 
 ## Running

@@ -394,17 +394,25 @@ class State(rx.State):
     def load_settings(self):
         from agent import settings as S
         d = S.load()
-        self.theme = d["theme"]
-        self.font_chat = d["font_chat"]
-        self.font_ui = d["font_ui"]
+        self.theme = d.get("theme", "auto")
+        self.font_chat = d.get("font_chat", 14)
+        self.font_ui = d.get("font_ui", 13)
         # Тему застосовує next-themes сам (зберігає в localStorage між перезавантаженнями);
         # set_color_mode НЕ можна викликати з бекенд-хендлера — лише шрифт через DOM.
         # PASTE_SETUP_JS — одноразово вішає document-listener вставки файлів (Ctrl+V).
         return [rx.call_script(self.ui_font_js), rx.call_script(PASTE_SETUP_JS)]
 
-    def _save_settings(self):
+    def _persist_settings(self):
         from agent import settings as S
-        S.save({"theme": self.theme, "font_chat": self.font_chat, "font_ui": self.font_ui})
+        S.save({
+            "theme": self.theme,
+            "font_chat": self.font_chat,
+            "font_ui": self.font_ui
+        })
+
+    @rx.event
+    def save_settings(self):
+        self._persist_settings()
 
     @rx.event
     def set_theme(self, v: str | list[str]):
@@ -413,18 +421,22 @@ class State(rx.State):
         if isinstance(v, list):
             v = v[0] if v else self.theme
         self.theme = v
-        self._save_settings()
+        self._persist_settings()
 
     @rx.event
-    def set_font_chat(self, v: int):
-        self.font_chat = max(12, min(20, int(v)))
-        self._save_settings()
+    def set_font_chat(self, v: str | list[str] | list[int]):
+        val = v[0] if isinstance(v, list) else v
+        # Кламп МУСИТЬ збігатися з min/max слайдера (12..32), інакше повзунок застрягає
+        # посеред шкали (хендлер ріже значення раніше за кінець доріжки).
+        self.font_chat = max(12, min(32, int(val)))
+        self._persist_settings()
 
     @rx.event
-    def set_font_ui(self, v: int):
-        self.font_ui = max(11, min(16, int(v)))
-        self._save_settings()
-        return rx.call_script(self.ui_font_js)     # застосувати масштаб інтерфейсу негайно
+    def set_font_ui(self, v: str | list[str] | list[int]):
+        val = v[0] if isinstance(v, list) else v
+        self.font_ui = max(11, min(24, int(val)))     # збігається зі слайдером 11..24
+        self._persist_settings()
+        return rx.call_script(self.ui_font_js)
 
     # ── Вкладення (#10) ────────────────────────────────────────────────────────
     @rx.event
@@ -499,6 +511,12 @@ class State(rx.State):
             att_note = self._attachments_note()    # шляхи файлів; виконавець читає read_file
         stop_ev = _STOP_EVENTS.get(cid)
         stopped = False
+        # Огляд усього плану — щоб виконавець кожного кроку бачив МЕТУ й сусідні кроки,
+        # а не отримував голий опис кроку без контексту (інакше на розмитому кроці модель
+        # «розмірковує» замість дії й крок тихо провалюється).
+        plan_overview = "\n".join(
+            f"  {'[x]' if s.status == 'done' else '[!]' if s.status == 'failed' else '[ ]'} "
+            f"#{s.id} [{s.kind}]: {s.description}" for s in plan.steps)
         for step in plan.steps:
             if stop_ev is not None and stop_ev.is_set():       # перервано між кроками
                 stopped = True
@@ -508,7 +526,8 @@ class State(rx.State):
             if step.kind == "inline":
                 plan.set_result(step.id, "done", "inline")
                 continue
-            step_ctx = f"Project root: {root}"
+            step_ctx = (f"Project root: {root}\n\nЗагальна задача: {plan.task}\n"
+                        f"Повний план (ти виконуєш ЛИШЕ крок #{step.id}):\n{plan_overview}")
             if self.context_summary:
                 step_ctx += f"\n{convo.as_context(self.context_summary)}"
             if att_note:
@@ -565,6 +584,7 @@ class State(rx.State):
         actions: list[tuple[str, str]] = []   # (tool, result)
         stats: list[dict] = []                # client.last_stats кожного виклику моделі
         final = "досягнуто ліміту ітерацій"
+        nudged = False
         for _ in range(max_iters):
             if stop_event is not None and stop_event.is_set():
                 final = "зупинено користувачем"; break
@@ -574,6 +594,18 @@ class State(rx.State):
                 stats.append(dict(client.last_stats))
             calls = msg.get("tool_calls") or []
             if not calls:
+                # Модель «розповіла», але не діяла. Якщо крок ще нічого не зробив —
+                # підштовхуємо РІВНО ОДИН раз викликати інструмент (типова слабкість
+                # gemma: думає про тул, але не емітить tool_call). Інакше крок тихо
+                # завершувався б без жодної реальної дії.
+                if not actions and not nudged:
+                    nudged = True
+                    messages.append({"role": "assistant", "content": msg.get("content", "")})
+                    messages.append({"role": "user", "content":
+                        "Ти не викликав жодного інструмента, лише описав намір. Виконай "
+                        "крок ДІЄЮ: виклич write_file / edit_file / create_from_source / "
+                        "run_shell / read_file. Не пояснюй — РОБИ."})
+                    continue
                 final = (msg.get("content") or "").strip(); break
             messages.append({"role": "assistant", "content": msg.get("content", ""),
                              "tool_calls": calls})
@@ -794,7 +826,13 @@ class State(rx.State):
         "MUST read the relevant files yourself with read_file — NEVER ask the user to "
         "paste or provide file contents, you can read them directly. Read the files you "
         "need, then answer concisely, citing the file/function. Do NOT propose code edits "
-        "unless asked. Answer in the user's language."
+        "unless asked. Answer in the user's language.\n"
+        "IMPORTANT about your capabilities: this is the read-only ANALYSIS mode, so here "
+        "you only have read tools. But the agent CAN edit files and run shell commands "
+        "(git commit/push, run tests, etc.) via run_shell/edit_file in its EXECUTION mode. "
+        "So if the user asks you to DO something (commit, push, run, modify a file), do NOT "
+        "say you are unable — instead tell them to phrase it as a task (e.g. 'commit and "
+        "push the changes') so the agent runs it in execution mode."
     )
 
     async def _answer_reply(self, text: str, ctx: str, att_note: str, root: str, client) -> str:
@@ -872,6 +910,14 @@ class State(rx.State):
                 self._select(s.id)
                 A.rename_session("_tmp", s.id)          # перенести файли _tmp → сесія
                 self.attachments = pre                  # _select затер chips — повертаємо
+            # Тека, введена в полі на головній сторінці, ще не збережена в сесію
+            # (save_folder окремо не викликали). Застосовуємо ДО перевірки — інакше
+            # надсилання з головної з уведеною текою хибно скаржиться «вкажіть теку».
+            if not self.project_root and self.folder_input.strip():
+                self.project_root = self.folder_input.strip()
+                if self.title in ("", "Новий чат"):
+                    self.title = Path(self.project_root).name
+                self._save_current()
             if self.mode != "chat" and not self.project_root:
                 self._append("assistant", "Спершу вкажіть робочу теку.", "note")
                 return
@@ -884,7 +930,7 @@ class State(rx.State):
             att_names = [a["name"] for a in self.attachments if not a.get("error")]
             self._append("user", text, attachments=att_names)
             self.attachments = []
-            if self.busy:                              # модель зайнята -> у чергу
+            if self.busy or self.has_pending or self.has_question:                              # модель зайнята або чекає на дію користувача -> у чергу
                 self.queued_text = (self.queued_text + "\n\n" + text).strip() if self.queued_text else text
                 return
             self.busy = True
@@ -910,7 +956,20 @@ class State(rx.State):
 
     async def _process_one(self, text: str):
         """Обробити ОДНЕ повідомлення (user-бульбашку вже додано). Включає фінальний
-        LLM-підсумок контексту. busy не чіпає — ним керує send_task/_drain_and_unbusy."""
+        LLM-підсумок контексту. busy не чіпає — ним керує send_task/_drain_and_unbusy.
+
+        Винятки (обрив зʼєднання з Ollama, кривий JSON тощо) ловимо тут і показуємо в
+        чаті — інакше виняток вилітає з background-події ДО того, як has_pending/
+        has_question/busy встигають скинутись, і кнопки/черга висять назавжди."""
+        try:
+            await self._process_one_inner(text)
+        except Exception as e:
+            async with self:
+                self.has_pending = False
+                self.has_question = False
+                self._append("assistant", f"⚠ Помилка: {e}", "note")
+
+    async def _process_one_inner(self, text: str):
         async with self:
             self._reset_tokens()
             # Свіжа стоп-подія на кожен запит, щоб stop_generation і виконавець кроків
@@ -983,7 +1042,14 @@ class State(rx.State):
             root = self.project_root
             plan_first = self.plan_first or self.edits == "ask"
         client = await asyncio.to_thread(get_client)
-        task, outcome = await self._resume_planning(value, root, plan_first, client)
+        task, outcome = value, ""
+        try:
+            task, outcome = await self._resume_planning(value, root, plan_first, client)
+        except Exception as e:
+            async with self:
+                self.has_pending = False
+                self.has_question = False
+                self._append("assistant", f"⚠ Помилка: {e}", "note")
         if (outcome or "").strip():
             async with self:
                 self.status = "Оновлюю памʼять…"
@@ -1065,34 +1131,43 @@ class State(rx.State):
         client = await asyncio.to_thread(get_client)
         s = sess.load_session(cid)
         plan = s.get_pending_plan()
-        outcome = await self._execute_steps(plan, root, client)
-
-        async with self:
-            s2 = sess.load_session(self.current_id)
-            s2.clear_pending_plan()
-            sess.save_session(s2)
-            self.has_pending = False
+        outcome = ""
+        try:
+            outcome = await self._execute_steps(plan, root, client)
+        except Exception as e:
+            async with self:
+                self._append("assistant", f"⚠ Помилка виконання: {e}", "note")
+        finally:
+            async with self:
+                s2 = sess.load_session(self.current_id)
+                s2.clear_pending_plan()
+                sess.save_session(s2)
+                self.has_pending = False
         if (outcome or "").strip():
             async with self:
                 self.status = "Оновлюю памʼять…"
             await self._update_summary(plan.task, outcome)
         await self._drain_and_unbusy()
 
-    @rx.event
-    def discard_pending(self):
-        if self.current_id:
-            s = sess.load_session(self.current_id)
-            s.clear_pending_plan()
-            sess.save_session(s)
-        self.has_pending = False
+    @rx.event(background=True)
+    async def discard_pending(self):
+        async with self:
+            if self.current_id:
+                s = sess.load_session(self.current_id)
+                s.clear_pending_plan()
+                sess.save_session(s)
+            self.has_pending = False
+        await self._drain_and_unbusy()           # черга могла накопичитись поки план чекав
 
-    @rx.event
-    def cancel_question(self):
-        if self.current_id:
-            s = sess.load_session(self.current_id)
-            s.clear_pending_question()
-            sess.save_session(s)
-        self._load_question(None)
+    @rx.event(background=True)
+    async def cancel_question(self):
+        async with self:
+            if self.current_id:
+                s = sess.load_session(self.current_id)
+                s.clear_pending_question()
+                sess.save_session(s)
+            self._load_question(None)
+        await self._drain_and_unbusy()            # те саме для скасованого питання
 
 
 def nav_item(icon: str, label: str, on_click=None) -> rx.Component:
@@ -1187,17 +1262,19 @@ def mode_switch() -> rx.Component:
 
 
 def settings_dialog() -> rx.Component:
-    def font_ctrl(label, value, on_dec, on_inc, min_v, max_v):
+    def font_slider(label, value, on_change, min_v, max_v):
         return rx.hstack(
-            rx.text(label, class_name="text-sm text-gray-300 w-36"),
-            rx.icon_button(rx.icon("minus", size=12), on_click=on_dec,
-                           size="1", variant="soft",
-                           disabled=value <= min_v),
-            rx.text(value, class_name="text-sm text-gray-100 w-6 text-center"),
-            rx.icon_button(rx.icon("plus", size=12), on_click=on_inc,
-                           size="1", variant="soft",
-                           disabled=value >= max_v),
-            class_name="items-center gap-2",
+            rx.text(label, class_name="text-sm text-gray-300 w-24 shrink-0"),
+            rx.slider(
+                value=[value],
+                on_change=on_change,
+                min=min_v,
+                max=max_v,
+                step=1,
+                class_name="flex-1",
+            ),
+            rx.text(value, "px", class_name="text-sm text-gray-400 w-10 shrink-0 text-right"),
+            class_name="items-center gap-3 w-full",
         )
 
     return rx.dialog.root(
@@ -1218,23 +1295,21 @@ def settings_dialog() -> rx.Component:
                     rx.segmented_control.item("Темна", value="dark"),
                     rx.segmented_control.item("Авто", value="system"),
                     value=State.theme,
-                    # set_color_mode мусить бути на фронтенд-тригері (інакше
-                    # setColorMode-хук не інжектиться → ReferenceError); State.set_theme
-                    # лише персистить вибір на диск.
+                    # set_color_mode — фронтенд-тригер, що реально перемикає тему (next-themes).
+                    # set_theme лише зберігає вибір у State/на диск; без set_color_mode тема
+                    # візуально не мінялась (це й був баг «перемикачі нічого не роблять»).
                     on_change=lambda v: [State.set_theme(v), set_color_mode(v)],
-                    size="1", class_name="mb-4",
+                    size="2", class_name="mb-4 w-full",
                 ),
                 # Шрифти
                 rx.text("Шрифти", class_name="text-xs text-gray-500 uppercase tracking-wide mb-2"),
-                font_ctrl("Чат (повідомлення)", State.font_chat,
-                          State.set_font_chat(State.font_chat - 1),
-                          State.set_font_chat(State.font_chat + 1), 12, 20),
-                font_ctrl("Інтерфейс", State.font_ui,
-                          State.set_font_ui(State.font_ui - 1),
-                          State.set_font_ui(State.font_ui + 1), 11, 16),
-                gap="2", class_name="min-w-80",
+                font_slider("Чат", State.font_chat,
+                            lambda v: State.set_font_chat(v), 12, 32),
+                font_slider("Інтерфейс", State.font_ui,
+                            lambda v: State.set_font_ui(v), 11, 24),
+                gap="4", class_name="w-full px-2",
             ),
-            style={"backgroundColor": PANEL},
+            style={"backgroundColor": PANEL, "maxWidth": "560px", "width": "92vw"},
         ),
         open=State.settings_open,
         on_open_change=State.toggle_settings,
@@ -1257,7 +1332,16 @@ def sidebar() -> rx.Component:
             class_name="flex-1 w-full gap-0.5 overflow-y-auto",
         ),
         rx.spacer(),
-        nav_item("settings", "Налаштування", State.toggle_settings),
+        # self-start: не розтягувати на всю ширину колонки (інакше контур-пігулка йде
+        # через увесь сайдбар). icon_button — квадрат за розміром іконки, ліворуч.
+        rx.icon_button(
+            rx.icon("settings", size=18),
+            on_click=State.toggle_settings,
+            variant="ghost",
+            color_scheme="gray",
+            size="2",
+            class_name="self-start mb-2 ml-1 rounded-full hover:bg-white/10 text-gray-400",
+        ),
         direction="column",
         class_name="w-64 h-full p-2 gap-0.5",
         style={"backgroundColor": PANEL, "borderRight": "1px solid rgba(255,255,255,0.08)"},

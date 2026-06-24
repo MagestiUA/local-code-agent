@@ -34,6 +34,14 @@ ALLOWED_SHELL = (
 )
 SHELL_TIMEOUT = 120
 
-# Профілі ролей: (think, num_ctx, temperature)
-EXECUTOR = {"think": False, "num_ctx": 128000, "temperature": 0.2}
-PLANNER  = {"think": True,  "num_ctx": 128000, "temperature": 0.3}
+# DRY-семплінг (Don't Repeat Yourself) — лише для EXECUTOR (тул-цикл): карає повтор
+# цілих ФРАЗ/послідовностей (напр. та сама невдала git-команда раз за разом), не
+# окремих токенів — тож не псує код, як грубий repeat_penalty. М'який multiplier
+# (емпірично 1.8 repeat_penalty ламав слова; DRY 0.3 зберігає зв'язність). Виклики з
+# format=schema захищені граматикою — DRY не зробить JSON невалідним. PLANNER (проза,
+# think=on) лишаємо без DRY. options мерджаться в payload у llm.chat/chat_stream.
+_DRY = {"dry_multiplier": 0.3, "dry_base": 1.75, "dry_allowed_length": 2}
+
+# Профілі ролей: (think, num_ctx, temperature, [options])
+EXECUTOR = {"think": False, "num_ctx": 65536, "temperature": 0.2, "options": _DRY}
+PLANNER  = {"think": True,  "num_ctx": 65536, "temperature": 0.3}

@@ -21,7 +21,13 @@ def main() -> None:
     assert chain.allowed  # префікс python дозволений
     assert "HACKED" not in chain.stdout, "ланцюжок виконався — діра в безпеці!"
 
-    print("OK: allow-list і захист від ланцюжків працюють")
+    # 4) Обгорткові лапки знімаються з токенів (commit-повідомлення / лапкові аргументи),
+    #    щоб `-m "msg"` давало чисте 'msg'. Перевірка через argv[1].
+    q = run_shell('python -c "import sys;print(sys.argv[1])" "hello world"')
+    assert q.allowed and q.returncode == 0, q.stderr
+    assert q.stdout.strip() == "hello world", repr(q.stdout)  # без лапок навколо
+
+    print("OK: allow-list, захист від ланцюжків і зняття лапок працюють")
     print(f"  python --version -> rc={r.returncode}")
     print(f"  'del important.txt' -> allowed={blocked.allowed} (заблоковано)")
     print(f"  ланцюжок -> 'HACKED' у виводі: {'HACKED' in chain.stdout}")

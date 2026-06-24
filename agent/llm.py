@@ -79,6 +79,7 @@ class OllamaClient:
             "options": {
                 "temperature": profile["temperature"],
                 "num_ctx": profile["num_ctx"],
+                **profile.get("options", {}),     # доп. семплінг профілю (напр. DRY)
             },
         }
         if tools:
@@ -109,6 +110,7 @@ class OllamaClient:
             "options": {
                 "temperature": profile["temperature"],
                 "num_ctx": profile["num_ctx"],
+                **profile.get("options", {}),     # доп. семплінг профілю (напр. DRY)
             },
         }
         if tools:

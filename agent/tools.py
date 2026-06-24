@@ -91,7 +91,12 @@ def run_shell(command: str, cwd: str | None = None, timeout: int | None = None,
     if not allow_all and not is_allowed(command, allow):
         return ShellResult(False, -1, "", f"заблоковано allow-list: {command!r}")
     try:
-        args = shlex.split(command, posix=False)
+        # posix=False зберігає зворотні слеші (потрібно для Windows-шляхів C:\...),
+        # але лишає лапки В токенах. Знімаємо парні обгорткові лапки, щоб
+        # `git commit -m "msg"` дав чисте 'msg', а не '"msg"', і щоб лапкові шляхи
+        # розпакувались (бекслеші всередині лишаються).
+        args = [a[1:-1] if len(a) >= 2 and a[0] == a[-1] and a[0] in "\"'" else a
+                for a in shlex.split(command, posix=False)]
         p = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
                            timeout=timeout, shell=False)
         return ShellResult(True, p.returncode, p.stdout, p.stderr)
