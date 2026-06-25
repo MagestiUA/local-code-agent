@@ -24,7 +24,7 @@ import re
 from pathlib import Path
 
 from . import config
-from .convo import _strip_echoed_label
+from .convo import _is_empty_echo, _strip_echoed_label
 from .llm import OllamaClient
 
 TOPICS_ROOT = Path(__file__).resolve().parent.parent / ".chat_topics"
@@ -119,7 +119,9 @@ def update_topic_note(prev: str, user_text: str, outcome: str,
         profile=profile,
     )
     out = _strip_echoed_label((msg.get("content") or "").strip(), "Поточна нотатка",
-                              "Updated note", "Note") or prev
+                              "Updated note", "Note")
+    if _is_empty_echo(out):
+        out = prev
     if len(out) > budget:
         msg2 = client.chat(
             [{"role": "system", "content": _MERGE_SYSTEM},
@@ -127,8 +129,9 @@ def update_topic_note(prev: str, user_text: str, outcome: str,
                                           "Новий хід:\n(немає — лише стисни вище)"}],
             profile=profile,
         )
-        out = _strip_echoed_label((msg2.get("content") or "").strip(), "Поточна нотатка",
-                                  "Updated note", "Note") or out
+        out2 = _strip_echoed_label((msg2.get("content") or "").strip(), "Поточна нотатка",
+                                   "Updated note", "Note")
+        out = out if _is_empty_echo(out2) else out2
     return out
 
 

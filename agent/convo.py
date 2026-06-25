@@ -19,6 +19,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from . import config
 from .llm import OllamaClient
 
@@ -119,15 +121,27 @@ _DIGEST_SYSTEM = (
 
 
 # Слабка модель часто ЛУНАЄ заголовок нашого ж промпту ("Поточний дайджест:",
-# "Поточна нотатка:") на початку відповіді замість чистого тексту — бачено живцем.
-# Прибираємо програмно, бо словами в промпті ("Output ONLY the digest") це не
-# завжди стримує.
+# "Поточна нотатка:") на початку відповіді замість чистого тексту — бачено живцем,
+# іноді обгорнутий у markdown ("**Поточна нотатка:**"). Прибираємо програмно
+# (regex толерує провідні *#_> та крапку з пробілами), бо словами в промпті
+# ("Output ONLY the digest") це не завжди стримує.
 def _strip_echoed_label(text: str, *labels: str) -> str:
     s = text.lstrip()
     for label in labels:
-        if s.lower().startswith(label.lower()):
-            return s[len(label):].lstrip(":：\n ").lstrip()
+        m = re.match(r'^[\s*#_>-]*' + re.escape(label) + r'[\s*:：]*', s, re.IGNORECASE)
+        if m:
+            return s[m.end():].lstrip()
     return text
+
+
+# Якщо модель не мала чим заповнити дайджест/нотатку (напр. перший хід занадто
+# куций) — вона іноді ЛУНАЄ наш власний плейсхолдер ("(порожньо)",
+# "(порожньо — це перший шматок)") замість того, щоб лишити поле незмінним.
+# Живий кейс: створився файл теми буквально з вмістом "(порожньо)" — сміття на
+# диску. Розпізнаємо й трактуємо як "нічого корисного не повернула".
+def _is_empty_echo(text: str) -> bool:
+    t = text.strip().strip("()").strip()
+    return not t or t.lower().startswith("порожньо")
 
 
 def update_digest(digest: str, chunk: str, client: OllamaClient | None = None,
@@ -145,7 +159,9 @@ def update_digest(digest: str, chunk: str, client: OllamaClient | None = None,
         profile=profile,
     )
     out = _strip_echoed_label((msg.get("content") or "").strip(), "Поточний дайджест",
-                              "Updated digest", "Digest") or digest
+                              "Updated digest", "Digest")
+    if _is_empty_echo(out):
+        out = digest
     if len(out) > budget:
         msg2 = client.chat(
             [{"role": "system", "content": _DIGEST_SYSTEM},
@@ -153,6 +169,7 @@ def update_digest(digest: str, chunk: str, client: OllamaClient | None = None,
                                           "Новий шматок документа:\n(немає — лише стисни вище)"}],
             profile=profile,
         )
-        out = _strip_echoed_label((msg2.get("content") or "").strip(), "Поточний дайджест",
-                                  "Updated digest", "Digest") or out
+        out2 = _strip_echoed_label((msg2.get("content") or "").strip(), "Поточний дайджест",
+                                   "Updated digest", "Digest")
+        out = out if _is_empty_echo(out2) else out2
     return out

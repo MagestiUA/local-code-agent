@@ -1008,6 +1008,11 @@ class State(rx.State):
         name = topics.classify_topic(user_text, outcome, existing, client, profile=config.CHAT_EXECUTOR)
         prev = topics.load_topic(name)
         note = topics.update_topic_note(prev, user_text, outcome, client, profile=config.CHAT_EXECUTOR)
+        if not note.strip():
+            # Куций хід (нема що класифікувати) -> модель не дала нічого корисного
+            # (update_topic_note вже відкинула луна-плейсхолдери) — НЕ створюємо
+            # сміттєвий файл теми. Живий кейс: "Новий topic.txt" з вмістом "(порожньо)".
+            return cur_topics
         topics.save_topic(name, note)
         return cur_topics if name in cur_topics else [*cur_topics, name]
 
