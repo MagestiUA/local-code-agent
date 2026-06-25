@@ -2094,7 +2094,6 @@ def streaming_bubble() -> rx.Component:
                 rx.markdown(State.stream_thinking, class_name="max-w-full overflow-x-auto break-words"),
                 class_name="mb-2 border-l-2 border-white/10 pl-2 max-h-80 max-w-full "
                            "overflow-y-auto overflow-x-hidden",
-                open=True,
             ),
             rx.fragment(),
         ),
