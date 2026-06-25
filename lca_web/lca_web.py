@@ -1980,7 +1980,8 @@ def input_box() -> rx.Component:
                     on_change=State.set_task,
                     enter_key_submit=True,
                     class_name="w-full bg-transparent text-gray-100 placeholder:text-gray-500 "
-                               "resize-none outline-none border-none text-base",
+                               "resize-none outline-none border-none",
+                    style={"fontSize": State.chat_font_px},
                     rows="2",
                 ),
                 controls_bar(),
