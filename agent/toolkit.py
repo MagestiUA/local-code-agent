@@ -98,9 +98,20 @@ def h_read_file(args, ctx):
     return text
 
 
+# Розмір шматка на один read_attachment-виклик. На num_ctx=131072 з резервом
+# ~20k токенів на system/tools/історію/відповідь лишається ~110k токенів ≈ 275k
+# символів (кирилиця ~2.5 симв./токен) на сам вміст в одній розмові — тобто
+# 32000 далеко не межа контексту; це баланс "менше раундів" (386KB → ~12 читань
+# замість 48 по 8000) проти "лишити моделі простір подумати над шматком".
+ATTACHMENT_CHUNK_SIZE = 32_000
+
+
 def h_read_attachment(args, ctx):
     """Прочитати прикріплений користувачем файл за іменем (нечіткий пошук у теці
-    вкладень сесії). Прощає неточності в довгому імені — exact → ci → підрядок."""
+    вкладень сесії). Прощає неточності в довгому імені — exact → ci → підрядок.
+    offset — позиція в символах, з якої читати (для великих файлів читай частинами:
+    кожен виклик повертає ATTACHMENT_CHUNK_SIZE символів і явно каже, який offset
+    передати в НАСТУПНОМУ виклику, поки файл не дочитано)."""
     d = ctx.attachments_dir
     if not d or not Path(d).is_dir():
         return "немає прикріплених файлів"
@@ -119,9 +130,18 @@ def h_read_attachment(args, ctx):
         names = ", ".join(p.name for p in files)
         return f"файл '{q}' не знайдено серед вкладень. Доступні: {names}"
     text = T.read_file(match)
-    if len(text) > 8000:
-        text = text[:8000] + f"\n\n…[обрізано: показано 8000 з {len(text)} символів]"
-    return f"=== {match.name} ===\n{text}"
+    try:
+        offset = max(0, int(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    total = len(text)
+    chunk = text[offset:offset + ATTACHMENT_CHUNK_SIZE]
+    end = offset + len(chunk)
+    header = f"=== {match.name} ({offset}-{end} з {total}) ===" if total > ATTACHMENT_CHUNK_SIZE else f"=== {match.name} ==="
+    if end < total:
+        chunk += (f"\n\n…[лишилось {total - end} символів. Щоб продовжити, виклич "
+                  f"read_attachment(name='{match.name}', offset={end})]")
+    return f"{header}\n{chunk}"
 
 
 def h_write_file(args, ctx):
@@ -205,8 +225,15 @@ def default_registry() -> ToolRegistry:
     r.register(Tool("read_attachment",
                     "Прочитати файл, ПРИКРІПЛЕНИЙ користувачем до повідомлення. Передай "
                     "ім'я файлу зі списку прикріплених (можна частину імені — пошук "
-                    "нечіткий). Використовуй ЦЕ замість read_file для вкладень.",
-                    {"name": {"type": "string", "description": "ім'я прикріпленого файлу"}},
+                    "нечіткий). Використовуй ЦЕ замість read_file для вкладень. Великі "
+                    "файли повертаються частинами (~32000 символів) — якщо у відповіді "
+                    "є позначка 'лишилось N символів... offset=X', виклич знову з тим "
+                    "offset, щоб дочитати решту.",
+                    {"name": {"type": "string", "description": "ім'я прикріпленого файлу"},
+                     "offset": {"type": "integer",
+                                "description": "з якого символу читати (0 — спочатку); "
+                                                "брати зі значення offset у позначці "
+                                                "'лишилось...' попереднього виклику"}},
                     ["name"], h_read_attachment))
     r.register(Tool("write_file",
                     "Створити або перезаписати файл із заданим вмістом. "

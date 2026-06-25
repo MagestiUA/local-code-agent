@@ -47,6 +47,19 @@ def main() -> None:
     big = reg.dispatch("read_file", {"path": "big.py"}, ctx)
     assert "обрізано" in big and "create_from_source" in big
 
+    # read_attachment: пагінація через offset для великих файлів
+    att_dir = root / ".att"
+    att_dir.mkdir()
+    (att_dir / "paste.txt").write_text("x" * 70_000, encoding="utf-8")
+    ctx_att = ToolContext(root=root, permissions={"edits": "auto", "shell": "allowlist"},
+                          attachments_dir=att_dir)
+    p1 = reg.dispatch("read_attachment", {"name": "paste.txt"}, ctx_att)
+    assert "0-32000 з 70000" in p1 and "offset=32000" in p1, p1
+    p2 = reg.dispatch("read_attachment", {"name": "paste.txt", "offset": 32000}, ctx_att)
+    assert "32000-64000 з 70000" in p2 and "offset=64000" in p2, p2
+    p3 = reg.dispatch("read_attachment", {"name": "paste.txt", "offset": 64000}, ctx_att)
+    assert "64000-70000 з 70000" in p3 and "лишилось" not in p3, p3   # останній шматок — без "лишилось"
+
     # невідомий тул
     assert "невідомий" in reg.dispatch("nope", {}, ctx)
 

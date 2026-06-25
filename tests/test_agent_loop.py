@@ -4,7 +4,7 @@
 import tempfile
 from pathlib import Path
 
-from agent.agent_loop import run_step
+from agent.agent_loop import pending_continuation, run_step
 from agent.toolkit import ToolContext
 
 
@@ -87,7 +87,34 @@ def main() -> None:
     assert (root / "after_malformed.txt").read_text(encoding="utf-8") == "ok2", "не впоралось з малформованим хвостом"
     assert "Готово" in final6
 
-    print("OK: tool-loop виконує тули через реєстр, завершується, ліміт ітерацій тримає, nudge витягує порожні/просочені відповіді, парсинг просочених викликів виконує дію напряму")
+    # pending_continuation: великий файл прочитано не повністю -> модель пише прозою
+    # замість виклику -> нюджимо НЕЗАЛЕЖНО від should_nudge (контент не порожній і
+    # не просочений, інакше вважався б валідним завершенням).
+    assert pending_continuation([
+        {"role": "tool", "content": "=== big.txt (0-32000 з 70000) ===\nabc\n\n"
+         "…[лишилось 38000 символів. Щоб продовжити, виклич "
+         "read_attachment(name='big.txt', offset=32000)]"},
+    ])
+    assert not pending_continuation([{"role": "tool", "content": "=== small.txt ===\nok"}])
+    assert not pending_continuation([])
+    att_dir = Path(tempfile.mkdtemp())
+    (att_dir / "big.txt").write_text("x" * 40_000, encoding="utf-8")
+    ctx_att = ToolContext(root=root, permissions={"edits": "auto", "shell": "allowlist"},
+                          attachments_dir=att_dir)
+    # Модель прочитала перший шматок, потім ЗАМІСТЬ продовження пагінації написала
+    # прозою "продовжую читати" (живий кейс: повторюється так 15+ разів підряд) —
+    # авто-відновлення саме дочитує решту, без участі моделі взагалі.
+    continue_then_done = LoopStub([
+        {"tool_calls": [{"function": {"name": "read_attachment",
+                                      "arguments": {"name": "big.txt", "offset": 0}}}]},
+        {"content": "Продовжую читати файл.", "tool_calls": []},   # не порожньо, не просочено
+        {"content": "Готово, прочитав усе.", "tool_calls": []},
+    ])
+    final7, log7 = run_step("прочитай big.txt", ctx_att, client=continue_then_done, max_iters=6)
+    assert "Готово" in final7, final7
+    assert sum(1 for e in log7 if "read_attachment" in e) == 2, log7   # offset=0 + авто-продовження offset=32000
+
+    print("OK: tool-loop виконує тули через реєстр, завершується, ліміт ітерацій тримає, nudge витягує порожні/просочені відповіді, парсинг просочених викликів виконує дію напряму, pending_continuation тримає пагінацію великих файлів")
     print(f"  журнал кроку 1: {log}")
 
 

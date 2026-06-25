@@ -17,7 +17,8 @@ from agent import attachments as A
 from agent import config
 from agent import convo
 from agent import session as sess
-from agent.agent_loop import _estimate_iters, NUDGE_TEXT, recover_tool_calls, should_nudge
+from agent.agent_loop import (_estimate_iters, NUDGE_TEXT, pending_continuation,
+                              recover_tool_calls, should_nudge)
 from agent.answerer import build_context
 from agent.intent import classify_intent
 from agent.llm import OllamaClient
@@ -601,15 +602,22 @@ class State(rx.State):
             calls, recovered = recover_tool_calls(msg)
             if not calls:
                 content = (msg.get("content") or "").strip()
+                # Великий файл дочитується частинами — якщо модель не продовжила
+                # пагінацію сама, дочитуємо БЕЗ її участі (текстовий nudge тут
+                # ненадійний, бачили живцем 15+ ідентичних повторів). Див. pending_continuation.
+                cont = pending_continuation(messages)
+                if cont is not None:
+                    calls, recovered = [cont], True
                 # Підштовхуємо РІВНО ОДИН раз, незалежно від того, чи вже були дії
                 # раніше у цьому кроці (живий кейс на account_test_14.py: модель
                 # почитала файл, потім видала порожню відповідь). НЕ ехо-имо
                 # зламаний/порожній текст назад як assistant. Див. agent_loop.should_nudge.
-                if should_nudge(content, nudged):
+                elif should_nudge(content, nudged):
                     nudged = True
                     messages.append({"role": "user", "content": NUDGE_TEXT})
                     continue
-                final = content; break
+                else:
+                    final = content; break
             messages.append({"role": "assistant", "content": "" if recovered else msg.get("content", ""),
                              "tool_calls": calls})
             for call in calls:
@@ -731,16 +739,24 @@ class State(rx.State):
                 tool_calls, recovered = recover_tool_calls(msg)
                 if not tool_calls:
                     content = (msg.get("content") or "").strip()
+                    # Великий файл читається частинами (read_attachment offset-пагінація,
+                    # toolkit.ATTACHMENT_CHUNK_SIZE) — якщо модель не продовжила сама,
+                    # дочитуємо БЕЗ її участі (текстовий nudge ненадійний, бачили живцем
+                    # 15+ ідентичних повторів "продовжую читати" без жодної дії).
+                    cont = pending_continuation(msgs)
+                    if cont is not None:
+                        tool_calls, recovered = [cont], True
                     # Якщо контент непорожній і не просочений — це справді "досить
                     # зібрано, йду відповідати" (валідний ранній вихід). Інакше раніше
                     # цикл просто `break`-ався без жодних зібраних даних (типово —
                     # вкладення взагалі не прочитане), звідси "(порожня відповідь)" на
                     # живому кейсі з великим paste-вкладенням. Див. agent_loop.should_nudge.
-                    if should_nudge(content, nudged):
+                    elif should_nudge(content, nudged):
                         nudged = True
                         msgs.append({"role": "user", "content": NUDGE_TEXT})
                         continue
-                    break
+                    else:
+                        break
                 msgs.append({"role": "assistant", "content": "" if recovered else msg.get("content", ""),
                              "tool_calls": tool_calls})
                 await self._dispatch_tool_calls(tool_calls, msgs, reg, tctx)

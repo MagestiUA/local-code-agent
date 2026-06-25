@@ -156,6 +156,36 @@ def should_nudge(content: str, already_nudged: bool) -> bool:
     return not already_nudged and (not content or _looks_like_leaked_tool_call(content))
 
 
+# Останній read_attachment повертає явну підказку "лишилось N символів, виклич
+# read_attachment(name='X', offset=N)" (toolkit.h_read_attachment). Якщо модель після
+# цього НЕ зробила той виклик, а написала прозою щось типу "продовжую читати" — текстовий
+# nudge тут НЕ зарадить: живцем бачили модель, що 15+ разів підряд повторює ТОЧНО ту саму
+# фразу, ігноруючи nudge. Маємо вже все потрібне (ім'я файлу + offset) з власної ж
+# підказки — тож ВИКОНУЄМО продовження самі, без участі моделі: гарантований прогрес
+# замість сподівання на співпрацю.
+_PENDING_CONTINUATION_RE = re.compile(r"read_attachment\(name='([^']+)',\s*offset=(\d+)\)\]\s*$")
+
+
+def pending_continuation(messages: list[dict]) -> dict | None:
+    """Якщо останній РЕАЛЬНИЙ tool-результат в історії містить незавершену пагінацію
+    read_attachment — повертає синтетичний tool_call (той самий формат, що й
+    recover_tool_calls) для автопродовження. Йдемо назад, пропускаючи власні
+    nudge-повідомлення ('user') — інакше після ПЕРШОГО nudge перевірка вже не бачить
+    tool-результат і мовчки здається."""
+    for m in reversed(messages):
+        role = m.get("role")
+        if role == "tool":
+            match = _PENDING_CONTINUATION_RE.search((m.get("content") or "").strip())
+            if not match:
+                return None
+            return {"function": {"name": "read_attachment",
+                                 "arguments": {"name": match.group(1), "offset": int(match.group(2))}}}
+        if role == "user":
+            continue   # пропускаємо власні nudge-репліки, шукаємо далі назад
+        return None   # assistant (реальний виклик уже відбувся) чи system — не pending
+    return None
+
+
 def _args(call: dict) -> dict:
     a = call.get("function", {}).get("arguments", {})
     if isinstance(a, str):
@@ -197,14 +227,22 @@ def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = Non
         calls, recovered = recover_tool_calls(msg)
         if not calls:
             content = (msg.get("content") or "").strip()
+            # Великий файл дочитується частинами (read_attachment offset) — якщо
+            # лишився непрочитаний хвіст, а модель не продовжила виклик, ДОЧИТУЄМО
+            # САМІ (текстовий nudge тут ненадійний — бачили живцем 15+ ідентичних
+            # повторів "продовжую читати" без жодної дії). Див. pending_continuation.
+            cont = pending_continuation(messages)
+            if cont is not None:
+                calls, recovered = [cont], True
             # НЕ повертаємо зламаний/порожній текст назад як assistant-повідомлення —
             # інакше модель копіює власну попередню відповідь і застрягає в тому
             # самому виводі навіть при повторі (перевірено живцем). Див. should_nudge.
-            if should_nudge(content, nudged):
+            elif should_nudge(content, nudged):
                 nudged = True
                 messages.append({"role": "user", "content": NUDGE_TEXT})
                 continue
-            return content, log
+            else:
+                return content, log
 
         # recovered=True: викликали тул з розпарсеного просоченого тексту — НЕ ехо-имо
         # сам зламаний текст назад (той самий анти-анкоринг, що й для nudge).
