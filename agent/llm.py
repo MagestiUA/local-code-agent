@@ -34,6 +34,7 @@ class OllamaClient:
         self.model = model
         self.host = host.rstrip("/")
         self.last_stats: dict = {}      # stats останнього chat() — для лічильника токенів
+        self.last_error: str = ""       # остання помилка з'єднання (діагностика)
         self._ensure_server()
 
     # ── Сервер ──────────────────────────────────────────────────────────────
@@ -62,6 +63,31 @@ class OllamaClient:
             except Exception:
                 pass
         raise RuntimeError("Ollama не відповіла після запуску")
+
+    def _post_with_retry(self, payload: dict, stream: bool = False,
+                         max_attempts: int = 3, backoff: float = 3.0):
+        """POST /api/chat з автовідновленням. Живий кейс: сторонній застосунок чи
+        користувач вимкнув Ollama-сервер посеред сесії — наступний запит раніше
+        падав з ConnectionError назавжди, поки хтось не піднімав сервер вручну.
+        Тепер: на ConnectionError/Timeout — спроба підняти сервер знову
+        (_ensure_server) і повтор із паузою, до max_attempts разів."""
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = requests.post(f"{self.host}/api/chat", json=payload, stream=stream,
+                                  timeout=config.REQUEST_TIMEOUT)
+                self.last_error = ""
+                return r
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exc = e
+                self.last_error = str(e)
+                if attempt < max_attempts:
+                    try:
+                        self._ensure_server()
+                    except Exception:
+                        pass
+                    time.sleep(backoff)
+        raise last_exc
 
     def unload(self) -> None:
         """Вивантажити модель з VRAM (keep_alive=0)."""
@@ -96,8 +122,7 @@ class OllamaClient:
             payload["tools"] = tools
         if fmt:
             payload["format"] = fmt
-        r = requests.post(f"{self.host}/api/chat", json=payload,
-                          timeout=config.REQUEST_TIMEOUT)
+        r = self._post_with_retry(payload)
         r.raise_for_status()
         data = r.json()
         self.last_stats = {"prompt": data.get("prompt_eval_count", 0) or 0,
@@ -129,8 +154,7 @@ class OllamaClient:
             payload["tools"] = tools
         if fmt:
             payload["format"] = fmt
-        with requests.post(f"{self.host}/api/chat", json=payload, stream=True,
-                           timeout=config.REQUEST_TIMEOUT) as r:
+        with self._post_with_retry(payload, stream=True) as r:
             r.raise_for_status()
             for line in r.iter_lines():
                 if stop_event and stop_event.is_set():
