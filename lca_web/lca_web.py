@@ -317,6 +317,12 @@ class State(rx.State):
                 s.project_id = ""
                 sess.save_session(s)
                 s_meta["project_id"] = ""
+        # Відновлюємо останній відкритий чат (якщо він і досі існує — захист від
+        # того самого класу "осиротілих" посилань, що й вище).
+        from agent import settings as S
+        last_id = S.load().get("last_session_id", "")
+        if last_id and any(s["id"] == last_id for s in self.sessions):
+            self._select(last_id)
 
     def _select(self, sid: str):
         s = sess.load_session(sid)
@@ -325,6 +331,7 @@ class State(rx.State):
         self.title = s.title
         self.project_root = s.project_root
         self.chat_project_id = s.project_id
+        self.current_project_id = s.project_id    # сайдбар-фільтр узгоджений із чатом
         self.edits = s.permissions.get("edits", "ask")
         self.shell = s.permissions.get("shell", "smart")
         self.plan_first = s.plan_first
@@ -335,6 +342,8 @@ class State(rx.State):
         self.session_topics = list(s.topics)
         self.attachments = []     # чіпи — стейджинг до відправки; вкладення сесії на диску
         self._load_question(s.pending_question)
+        from agent import settings as S
+        S.save({**S.load(), "last_session_id": sid})
 
     def _load_question(self, q: dict | None):
         """Відновити стан питання планувальника зі збереженого pending_question."""
@@ -421,6 +430,10 @@ class State(rx.State):
         if self.current_id == sid:
             self._clear_view()
         self.sessions = sess.list_sessions()
+        from agent import settings as S
+        cur = S.load()
+        if cur.get("last_session_id") == sid:
+            S.save({**cur, "last_session_id": ""})
 
     # ── Проекти chat-режиму ──────────────────────────────────────────────────
     @rx.event
@@ -546,11 +559,10 @@ class State(rx.State):
 
     def _persist_settings(self):
         from agent import settings as S
-        S.save({
-            "theme": self.theme,
-            "font_chat": self.font_chat,
-            "font_ui": self.font_ui
-        })
+        # Мерджимо з тим, що вже на диску — інакше затираємо інші ключі (напр.
+        # last_session_id), які записує не лише ця функція.
+        S.save({**S.load(), "theme": self.theme, "font_chat": self.font_chat,
+               "font_ui": self.font_ui})
 
     @rx.event
     def save_settings(self):

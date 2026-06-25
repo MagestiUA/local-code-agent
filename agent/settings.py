@@ -5,7 +5,8 @@ SETTINGS_FILE = Path.home() / ".local-code-agent" / "settings.json"
 DEFAULT = {
     "theme": "auto",
     "font_chat": 14,
-    "font_ui": 13
+    "font_ui": 13,
+    "last_session_id": "",     # відновлюємо останній відкритий чат після перезапуску
 }
 
 def load() -> dict:
