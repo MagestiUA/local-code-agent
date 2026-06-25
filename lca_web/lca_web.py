@@ -27,7 +27,7 @@ from agent.llm import OllamaClient
 from agent.memory import render_for_planner
 from agent.planner import deliberate
 from agent.project import load_project_doc, scan_structure
-from agent.toolkit import ToolContext, default_registry
+from agent.toolkit import ATTACHMENT_CHUNK_SIZE, ToolContext, default_registry
 
 CHAT_SYSTEM = (
     "You are a helpful thinking assistant. You can search the web with the web_search "
@@ -844,16 +844,30 @@ class State(rx.State):
         return body
 
     async def _estimate_rounds(self, text: str, names: list, client,
-                               profile: dict = config.EXECUTOR) -> int:
+                               profile: dict = config.EXECUTOR, cid: str = "") -> int:
         """Адаптивний ліміт раундів тул-циклу. Коли є прикріплені файли — оцінюємо
         через _estimate_iters (модель каже n тул-викликів → max(6, n*2)), щоб ліміт
         масштабувався під кількість/складність файлів, а не впирався в хардкод. Без
         файлів — дефолт 6 (ліміт усе одно не зв'язує простий чат: він завершується
-        першим раундом без тулів). profile: chat-режим передає CHAT_EXECUTOR (gemma)."""
+        першим раундом без тулів). profile: chat-режим передає CHAT_EXECUTOR (gemma).
+
+        Модель не знає РЕАЛЬНОГО розміру файлу (бачить лише імʼя), тож її власна
+        оцінка систематично занижена для великих вкладень — живий кейс: цикл
+        вичерпав раунди на півдорозі через 386KB файл і пішов на синтез із
+        недочитаним дайджестом (обірвана відповідь). Розмір ми знаємо ДЕТЕРМІНОВАНО
+        (без LLM) — рахуємо мінімум раундів від нього напряму й беремо максимум з
+        оцінкою моделі, а не покладаємось лише на її вгадування."""
         if not names:
             return 6
-        return await asyncio.to_thread(
+        size_floor = 6
+        if cid:
+            sizes = {n["name"]: n["size"] for n in A.list_saved(cid)}
+            total_chunks = sum(-(-sizes.get(n, 0) // ATTACHMENT_CHUNK_SIZE) for n in names)
+            if total_chunks:
+                size_floor = total_chunks + 4   # +4 запас на нюджі/нечитальні раунди
+        model_estimate = await asyncio.to_thread(
             lambda: _estimate_iters(text, "files: " + "; ".join(names), client, profile=profile))
+        return max(model_estimate, size_floor)
 
     @staticmethod
     def _inject_files(content: str, cur_names: list, other_names: list) -> str:
@@ -899,7 +913,7 @@ class State(rx.State):
         system = CHAT_SYSTEM + ("\n\n" + topics_note if topics_note else "")
         msgs = [{"role": "system", "content": system}] + history
         rounds = await self._estimate_rounds(text, cur_atts or all_names, client,
-                                             profile=config.CHAT_EXECUTOR)
+                                             profile=config.CHAT_EXECUTOR, cid=cid)
         # think=off-збір, коли в сесії Є файли ЧИ доступні теми минулих розмов — щоб
         # модель НАДІЙНО викликала read_attachment/read_topic (think=on часто «думає»
         # про тул, але не викликає). Чистий чат без файлів/тем → think=on-стрім без
@@ -945,7 +959,7 @@ class State(rx.State):
         user = "\n\n".join(p for p in parts if p)
         msgs = [{"role": "system", "content": ANSWER_SYSTEM},
                 {"role": "user", "content": user}]
-        rounds = await self._estimate_rounds(text, cur_atts or all_names, client)
+        rounds = await self._estimate_rounds(text, cur_atts or all_names, client, cid=cid)
         # answer-режим = аналіз коду: ЗАВЖДИ think=off-збір, щоб модель надійно читала
         # файли проєкту (read_file/list_dir). Без цього вона лише «планує» прозою й
         # зупиняється, нічого не прочитавши (саме той баг «стоп після планування»).
