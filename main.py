@@ -103,7 +103,10 @@ def main() -> None:
             print(f"Сервер не повідомив URL за {STARTUP_TIMEOUT:.0f}с — дивіться лог вище.")
             return
         import webview
-        webview.create_window("local-code-agent", url, width=1280, height=860, min_size=(800, 600))
+        # text_select=False — дефолт pywebview, забороняє виділення/копіювання
+        # тексту в усьому вікні (живий кейс: текст у чаті неможливо було виділити).
+        webview.create_window("local-code-agent", url, width=1280, height=860,
+                              min_size=(800, 600), text_select=True)
         webview.start()
     finally:
         _stop_server(proc)
