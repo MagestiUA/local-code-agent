@@ -17,7 +17,7 @@ from agent import attachments as A
 from agent import config
 from agent import convo
 from agent import session as sess
-from agent.agent_loop import _estimate_iters, _looks_like_leaked_tool_call
+from agent.agent_loop import _estimate_iters, NUDGE_TEXT, should_nudge
 from agent.answerer import build_context
 from agent.intent import classify_intent
 from agent.llm import OllamaClient
@@ -602,20 +602,12 @@ class State(rx.State):
             if not calls:
                 content = (msg.get("content") or "").strip()
                 # Підштовхуємо РІВНО ОДИН раз, незалежно від того, чи вже були дії
-                # раніше у цьому кроці (раніше нюджалось лише на ПЕРШІЙ спробі — тож
-                # якщо модель спочатку щось почитала, а потім видала порожню/просочену
-                # відповідь, крок тихо "завершувався" без результату — саме так стався
-                # живий кейс на account_test_14.py). НЕ ехо-имо зламаний/порожній текст
-                # назад як assistant — модель копіює власну попередню відповідь і
-                # застрягає в тому самому виводі (перевірено живцем у agent_loop).
-                if not nudged and (not content or _looks_like_leaked_tool_call(content)):
+                # раніше у цьому кроці (живий кейс на account_test_14.py: модель
+                # почитала файл, потім видала порожню відповідь). НЕ ехо-имо
+                # зламаний/порожній текст назад як assistant. Див. agent_loop.should_nudge.
+                if should_nudge(content, nudged):
                     nudged = True
-                    messages.append({"role": "user", "content":
-                        "Крок ще не виконано: попередня відповідь не містила ні дії "
-                        "(tool call), ні підсумку. Якщо крок уже зроблено — напиши "
-                        "коротке підтвердження. Якщо ще ні — виклич потрібний "
-                        "інструмент як справжній tool/function call (structured), НЕ "
-                        "як текст і НЕ в XML-тегах у відповіді."})
+                    messages.append({"role": "user", "content": NUDGE_TEXT})
                     continue
                 final = content; break
             messages.append({"role": "assistant", "content": msg.get("content", ""),
@@ -739,19 +731,14 @@ class State(rx.State):
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
                     content = (msg.get("content") or "").strip()
-                    # Якщо модель не викликала жоден тул і відповідь порожня/просочена
-                    # (XML-теги замість structured tool_calls) — раніше цикл просто
-                    # `break`-ався і йшов на фінальний синтез БЕЗ жодних зібраних даних
-                    # (типово — вкладення взагалі не прочитане). Звідси "(порожня
-                    # відповідь)" на живому кейсі з великим paste-вкладенням. Нюджимо
-                    # РІВНО ОДИН раз; якщо контент непорожній і не просочений — це
-                    # справді "досить зібрано, йду відповідати" (валідний ранній вихід).
-                    if not nudged and (not content or _looks_like_leaked_tool_call(content)):
+                    # Якщо контент непорожній і не просочений — це справді "досить
+                    # зібрано, йду відповідати" (валідний ранній вихід). Інакше раніше
+                    # цикл просто `break`-ався без жодних зібраних даних (типово —
+                    # вкладення взагалі не прочитане), звідси "(порожня відповідь)" на
+                    # живому кейсі з великим paste-вкладенням. Див. agent_loop.should_nudge.
+                    if should_nudge(content, nudged):
                         nudged = True
-                        msgs.append({"role": "user", "content":
-                            "Виклич потрібний інструмент (напр. read_attachment) як "
-                            "справжній tool/function call — не просто опиши намір і "
-                            "НЕ пиши його як текст/XML-теги у відповіді."})
+                        msgs.append({"role": "user", "content": NUDGE_TEXT})
                         continue
                     break
                 msgs.append({"role": "assistant", "content": msg.get("content", ""),

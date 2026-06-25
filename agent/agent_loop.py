@@ -85,6 +85,27 @@ def _looks_like_leaked_tool_call(content: str) -> bool:
     return bool(content) and bool(_LEAKED_CALL_RE.search(content))
 
 
+# Спільна для УСІХ tool-loop'ів (agent_loop.run_step, lca_web._run_tool_step,
+# lca_web._run_tool_chat) перевірка "чи варто підштовхнути модель ще раз замість
+# того, щоб прийняти цю відповідь як фінальну". Раніше кожен loop мав свою копію
+# цієї перевірки — фікс одного й того ж бага (порожня/просочена відповідь без
+# tool_calls тихо приймається як "крок завершено") довелось вносити в трьох місцях
+# окремо. Differences між циклами (sync/async виклик моделі, continue циклу чи
+# перехід в іншу фазу) лишаються в кожному місці — тут лише ОДНЕ рішення + текст.
+NUDGE_TEXT = (
+    "Виклич потрібний інструмент як справжній tool/function call (structured), НЕ "
+    "як текст і НЕ в XML-тегах у відповіді."
+)
+
+
+def should_nudge(content: str, already_nudged: bool) -> bool:
+    """True, якщо модель не виконала дію (content порожній, або спроба виклику тула
+    просочилась як текст замість structured tool_calls — плутанина тегів
+    <tool_call>/<tools>, бачено на qwen3-coder) і ще НЕ нюджили цього разу (рівно
+    один nudge — щоб не зациклитись, якщо модель стабільно ламає формат)."""
+    return not already_nudged and (not content or _looks_like_leaked_tool_call(content))
+
+
 def _args(call: dict) -> dict:
     a = call.get("function", {}).get("arguments", {})
     if isinstance(a, str):
@@ -126,22 +147,12 @@ def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = Non
         calls = msg.get("tool_calls") or []
         if not calls:
             content = (msg.get("content") or "").strip()
-            # Дві ознаки, що крок насправді НЕ завершено, а модель просто не змогла
-            # видати дію: (1) спроба викликати тул просочилась як текст замість
-            # structured tool_calls (плутанина тегів — бачили на qwen3-coder), або
-            # (2) відповідь порожня (модель "видихнулась" після довгого аналізу, не
-            # дійшовши до дії чи підсумку). Без цієї перевірки крок тихо "завершується"
-            # без жодного результату. НЕ повертаємо зламаний/порожній текст назад як
-            # assistant-повідомлення — інакше модель копіює власну попередню відповідь
-            # і застрягає в тому самому виводі навіть при повторі (перевірено живцем).
-            if not nudged and (not content or _looks_like_leaked_tool_call(content)):
+            # НЕ повертаємо зламаний/порожній текст назад як assistant-повідомлення —
+            # інакше модель копіює власну попередню відповідь і застрягає в тому
+            # самому виводі навіть при повторі (перевірено живцем). Див. should_nudge.
+            if should_nudge(content, nudged):
                 nudged = True
-                messages.append({"role": "user", "content":
-                    "Крок ще не виконано: попередня відповідь не містила ні дії "
-                    "(tool call), ні підсумку. Якщо крок уже зроблено — напиши коротке "
-                    "підтвердження. Якщо ще ні — виклич потрібний інструмент як "
-                    "справжній tool/function call (structured), НЕ як текст і НЕ в "
-                    "XML-тегах у відповіді."})
+                messages.append({"role": "user", "content": NUDGE_TEXT})
                 continue
             return content, log
 
