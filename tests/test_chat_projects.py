@@ -1,13 +1,21 @@
 """Офлайн-тест проектів chat-режиму (chat_projects). Запуск:
 .venv\\Scripts\\python.exe -m tests.test_chat_projects
-"""
+
+ІЗОЛЯЦІЯ: підміняємо CP.PROJECTS_DIR на тимчасову теку на час тесту. Раніше тест
+видаляв (shutil.rmtree) РЕАЛЬНУ ~/.local-code-agent/chat_projects/ — кожен
+прогін тестів стирав справжні проекти користувача без жодного попередження
+(живий кейс: користувацький проект зник після кількох прогонів цього тесту
+в одній сесії). НІКОЛИ не чіпати продакшен-шлях у тесті."""
 import shutil
+import tempfile
+from pathlib import Path
 
 from agent import chat_projects as CP
 
 
 def main() -> None:
-    shutil.rmtree(CP.PROJECTS_DIR, ignore_errors=True)
+    real_dir = CP.PROJECTS_DIR
+    CP.PROJECTS_DIR = Path(tempfile.mkdtemp()) / "chat_projects"
     try:
         assert CP.list_projects() == []
 
@@ -55,6 +63,7 @@ def main() -> None:
               "сортування, видалення, as_system_block")
     finally:
         shutil.rmtree(CP.PROJECTS_DIR, ignore_errors=True)
+        CP.PROJECTS_DIR = real_dir
 
 
 if __name__ == "__main__":

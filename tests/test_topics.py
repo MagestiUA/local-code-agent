@@ -1,7 +1,14 @@
 """Офлайн-тест спільних тем chat-режиму (topics) зі стаб-моделлю.
 Запуск:  .venv\\Scripts\\python.exe -m tests.test_topics
-"""
+
+ІЗОЛЯЦІЯ: підміняємо topics.TOPICS_ROOT на тимчасову теку на час тесту. Раніше
+тест видаляв (shutil.rmtree) РЕАЛЬНУ .chat_topics/ у репо — кожен прогін
+стирав справжні теми користувача без попередження (живий кейс: тема "Аналіз
+дайджесту червня 2026" зникла після кількох прогонів цього тесту в одній
+сесії). НІКОЛИ не чіпати продакшен-шлях у тесті."""
 import shutil
+import tempfile
+from pathlib import Path
 
 from agent import topics
 
@@ -18,7 +25,8 @@ class Stub:
 
 
 def main() -> None:
-    shutil.rmtree(topics.TOPICS_ROOT, ignore_errors=True)
+    real_root = topics.TOPICS_ROOT
+    topics.TOPICS_ROOT = Path(tempfile.mkdtemp()) / ".chat_topics"
     try:
         assert topics.list_topics() == []
 
@@ -94,6 +102,7 @@ def main() -> None:
               "fallback на невалідний JSON, topics_note, захист імені файлу")
     finally:
         shutil.rmtree(topics.TOPICS_ROOT, ignore_errors=True)
+        topics.TOPICS_ROOT = real_root
 
 
 if __name__ == "__main__":
