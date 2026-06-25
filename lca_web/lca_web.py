@@ -305,6 +305,18 @@ class State(rx.State):
     def load_sessions(self):
         self.sessions = sess.list_sessions()
         self.projects = CP.list_projects()
+        # Самозцілення: чат може лишитись з посиланням на проект, якого вже
+        # нема на диску (живий кейс: чат "зник" із сайдбара, бо ховався за
+        # фільтром неіснуючого проекту — і "чатів", і "проектів" виглядало
+        # порожньо одночасно). Звіряємо й чистимо осиротілі project_id.
+        valid_ids = {p["id"] for p in self.projects}
+        for s_meta in self.sessions:
+            pid = s_meta.get("project_id") or ""
+            if pid and pid not in valid_ids:
+                s = sess.load_session(s_meta["id"])
+                s.project_id = ""
+                sess.save_session(s)
+                s_meta["project_id"] = ""
 
     def _select(self, sid: str):
         s = sess.load_session(sid)
