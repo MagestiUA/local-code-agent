@@ -938,9 +938,23 @@ class State(rx.State):
             if not text:
                 return
             self.task = ""
+            att_names = [a["name"] for a in self.attachments if not a.get("error")]
+            # Великий вставлений/набраний текст у полі вводу не має жодного ліміту
+            # (на відміну від файлових вкладень — MAX_FILE_SIZE) і летить прямо в
+            # промпт, переповнюючи контекст (живий кейс: 687k символів — модель
+            # падає). Той самий ліміт, що й для файлів — понад нього зберігаємо як
+            # вкладення на диск; модель читає частинами через read_attachment, а не
+            # отримує суцільний блок у контексті.
+            if len(text) > A.MAX_FILE_SIZE:
+                kb = len(text) // 1024
+                paste_name = f"paste_{int(time.time())}.txt"
+                A.save(self.current_id, paste_name, text)
+                att_names.append(paste_name)
+                text = (f"[Вставлений текст ({kb} KB) занадто великий для прямого "
+                        f"включення — збережено як вкладення '{paste_name}'. Прочитай "
+                        f"його частинами через read_attachment('{paste_name}').]")
             # Імена прикріплених файлів → у саме повідомлення (видно в чаті), потім
             # стейджинг-чіпи прибираємо з-під інпута. Файли лишаються на диску.
-            att_names = [a["name"] for a in self.attachments if not a.get("error")]
             self._append("user", text, attachments=att_names)
             self.attachments = []
             if self.busy or self.has_pending or self.has_question:                              # модель зайнята або чекає на дію користувача -> у чергу
