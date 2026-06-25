@@ -4,7 +4,8 @@
   EXECUTOR — механічне виконання: думання ВИМКНЕНО, увесь бюджет на код, швидко.
   PLANNER  — декомпозиція й аналіз: думання УВІМКНЕНО.
 
-num_ctx=128000 — заміряна солодка точка (≈107 t/s, майже все на GPU).
+num_ctx=131072 — sweet spot за бенчмарком q4_0+flash attention (gemma4 113.5→108.5
+t/s, лише -4% проти 65536; за 262144 падіння вже різке — лишаємо як опцію не дефолт).
 Не варіюємо num_ctx між профілями — інакше Ollama перевантажує модель.
 """
 from __future__ import annotations
@@ -43,5 +44,5 @@ SHELL_TIMEOUT = 120
 _DRY = {"dry_multiplier": 0.3, "dry_base": 1.75, "dry_allowed_length": 2}
 
 # Профілі ролей: (think, num_ctx, temperature, [options])
-EXECUTOR = {"think": False, "num_ctx": 65536, "temperature": 0.2, "options": _DRY}
-PLANNER  = {"think": True,  "num_ctx": 65536, "temperature": 0.3}
+EXECUTOR = {"think": False, "num_ctx": 131072, "temperature": 0.2, "options": _DRY}
+PLANNER  = {"think": True,  "num_ctx": 131072, "temperature": 0.3}

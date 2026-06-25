@@ -109,6 +109,27 @@ rxconfig.py      конфіг Reflex
 - Python 3.12, `requests`, `reflex==0.9.5.post2`, `ddgs` (веб-пошук)
 - Ollama з моделлю `gemma4:26b-a4b-it-qat`
 
+## Ollama: q4_0 KV-cache + flash attention
+
+За бенчмарком (gemma4 / qwen3-coder, контекст 65536→131072→262144) `q4_0` KV-cache +
+flash attention дають майже безкоштовне подвоєння контексту (gemma4 113.5→108.5 t/s,
+-4%) і помітно менший VRAM (KV-буфер падає в ~3.5 рази: 12288 MiB → 3456 MiB на
+131072). Тому `agent/llm.py` `_ensure_server` піднімає `ollama serve` з
+`OLLAMA_FLASH_ATTENTION=1` і `OLLAMA_KV_CACHE_TYPE=q4_0` у env — для БУДЬ-якої моделі,
+без правок per-model.
+
+**Пастка на Windows**: десктоп-трей `ollama app.exe` має власний наглядач, який
+перезапускає сервер зі своїм (старим) env-блоком — зміна User env vars через
+`setx`/System Properties не доходить до вже запущеного наглядача без повного
+перелогіну/перезавантаження. Якщо трей-апка встигає піднятись першою, наш env
+просто ігнорується.
+
+Тому: автостарт `ollama app.exe` вимкнено (ярлик з `...\Startup\Ollama.lnk` прибрано
+в `%USERPROFILE%\Ollama_autostart_disabled.lnk`) — сервер тепер піднімає лише наш
+код (`_ensure_server`, явний `env=` у `subprocess.Popen`, незалежно від системного
+реєстру). Перший запуск `python main.py` після перезавантаження машини стартує
+Ollama сам; трей-іконки більше не буде.
+
 ## Запуск
 
 ```powershell

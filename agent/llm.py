@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 
@@ -42,10 +43,16 @@ class OllamaClient:
             return
         except Exception:
             pass
+        # q4_0 KV-cache + flash attention — за бенчмарком дають практично безкоштовне
+        # 2x контексту (gemma4 113.5→108.5 t/s на 65536→131072); дефолт для УСІХ моделей.
+        # Діє лише коли МИ піднімаємо сервер — якщо ollama serve вже запущено ззовні
+        # (напр. іншим клієнтом), його env не змінюємо.
+        env = {**os.environ, "OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_KV_CACHE_TYPE": "q4_0"}
         subprocess.Popen(
             ["ollama", "serve"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=env,
         )
         for _ in range(retries):
             time.sleep(delay)

@@ -40,7 +40,29 @@ def main() -> None:
     final2, log2 = run_step("безкінечно", ctx, client=inf, max_iters=3)
     assert "ліміт" in final2 and len(log2) == 3, (final2, log2)
 
-    print("OK: tool-loop виконує тули через реєстр, завершується, ліміт ітерацій тримає")
+    # Порожня відповідь без tool_calls (модель "видихнулась") -> nudge -> реальна дія.
+    empty_then_call = LoopStub([
+        {"content": "", "tool_calls": []},
+        {"tool_calls": [{"function": {"name": "write_file",
+                                      "arguments": {"path": "after_nudge.txt", "content": "ok"}}}]},
+        {"content": "Готово", "tool_calls": []},
+    ])
+    final3, log3 = run_step("створи after_nudge.txt", ctx, client=empty_then_call, max_iters=5)
+    assert (root / "after_nudge.txt").read_text(encoding="utf-8") == "ok", "nudge не витягнув крок"
+    assert "Готово" in final3
+
+    # Просочений виклик тула як текст (<tool_call>/<tools> у content) -> nudge -> дія.
+    leaked_then_call = LoopStub([
+        {"content": '<tools>\n{"name": "write_file"}\n</tools>', "tool_calls": []},
+        {"tool_calls": [{"function": {"name": "write_file",
+                                      "arguments": {"path": "after_leak.txt", "content": "ok"}}}]},
+        {"content": "Готово", "tool_calls": []},
+    ])
+    final4, log4 = run_step("створи after_leak.txt", ctx, client=leaked_then_call, max_iters=5)
+    assert (root / "after_leak.txt").read_text(encoding="utf-8") == "ok", "nudge не витягнув крок (leak)"
+    assert "Готово" in final4
+
+    print("OK: tool-loop виконує тули через реєстр, завершується, ліміт ітерацій тримає, nudge витягує порожні/просочені відповіді")
     print(f"  журнал кроку 1: {log}")
 
 

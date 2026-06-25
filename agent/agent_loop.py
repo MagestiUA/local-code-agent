@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from . import config
 from .llm import OllamaClient
@@ -73,6 +74,17 @@ def _estimate_iters(step_text: str, context: str, client: OllamaClient) -> int:
         return 15
 
 
+# Деякі моделі (помічено на qwen3-coder) під складеними інструкціями плутають тег
+# самого виклику (<tool_call>) із тегом опису сигнатур (<tools>) і виводять спробу
+# викликати тул як звичайний текст замість structured tool_calls. Без цієї перевірки
+# крок "тихо" завершується без жодної дії (calls=[] виглядає як "модель закінчила").
+_LEAKED_CALL_RE = re.compile(r'<tool_call>|<tools>|"arguments"\s*:\s*\{', re.IGNORECASE)
+
+
+def _looks_like_leaked_tool_call(content: str) -> bool:
+    return bool(content) and bool(_LEAKED_CALL_RE.search(content))
+
+
 def _args(call: dict) -> dict:
     a = call.get("function", {}).get("arguments", {})
     if isinstance(a, str):
@@ -103,6 +115,7 @@ def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = Non
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": user}]
     log: list[str] = []
+    nudged = False
 
     for _ in range(max_iters):
         if stop_event is not None and stop_event.is_set():
@@ -112,7 +125,25 @@ def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = Non
             stats_sink.append(dict(client.last_stats))
         calls = msg.get("tool_calls") or []
         if not calls:
-            return (msg.get("content") or "").strip(), log
+            content = (msg.get("content") or "").strip()
+            # Дві ознаки, що крок насправді НЕ завершено, а модель просто не змогла
+            # видати дію: (1) спроба викликати тул просочилась як текст замість
+            # structured tool_calls (плутанина тегів — бачили на qwen3-coder), або
+            # (2) відповідь порожня (модель "видихнулась" після довгого аналізу, не
+            # дійшовши до дії чи підсумку). Без цієї перевірки крок тихо "завершується"
+            # без жодного результату. НЕ повертаємо зламаний/порожній текст назад як
+            # assistant-повідомлення — інакше модель копіює власну попередню відповідь
+            # і застрягає в тому самому виводі навіть при повторі (перевірено живцем).
+            if not nudged and (not content or _looks_like_leaked_tool_call(content)):
+                nudged = True
+                messages.append({"role": "user", "content":
+                    "Крок ще не виконано: попередня відповідь не містила ні дії "
+                    "(tool call), ні підсумку. Якщо крок уже зроблено — напиши коротке "
+                    "підтвердження. Якщо ще ні — виклич потрібний інструмент як "
+                    "справжній tool/function call (structured), НЕ як текст і НЕ в "
+                    "XML-тегах у відповіді."})
+                continue
+            return content, log
 
         messages.append({"role": "assistant", "content": msg.get("content", ""),
                          "tool_calls": calls})

@@ -110,6 +110,27 @@ auto-drafts `AGENT.md` for a new repo.
 - Python 3.12, `requests`, `reflex==0.9.5.post2`, `ddgs` (web search)
 - Ollama with the `gemma4:26b-a4b-it-qat` model
 
+## Ollama: q4_0 KV-cache + flash attention
+
+Per our benchmark (gemma4 / qwen3-coder, context 65536→131072→262144), `q4_0`
+KV-cache + flash attention give an almost-free context doubling (gemma4
+113.5→108.5 t/s, -4%) and noticeably lower VRAM (KV buffer drops ~3.5x: 12288 MiB
+→ 3456 MiB at 131072). So `agent/llm.py` `_ensure_server` starts `ollama serve` with
+`OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q4_0` in its env — for ANY
+model, no per-model tweaking needed.
+
+**Windows gotcha**: the desktop tray app `ollama app.exe` has its own supervisor
+that restarts the server with its own (stale) env block — a User env var change via
+`setx`/System Properties doesn't reach an already-running supervisor without a full
+logoff/reboot. If the tray app wins the race and starts first, our env is simply
+ignored.
+
+So: `ollama app.exe` autostart is disabled (the `...\Startup\Ollama.lnk` shortcut was
+moved to `%USERPROFILE%\Ollama_autostart_disabled.lnk`) — only our own code
+(`_ensure_server`, explicit `env=` on `subprocess.Popen`, independent of the system
+registry) starts the server now. The first `python main.py` run after a reboot
+starts Ollama itself; there's no tray icon anymore.
+
 ## Running
 
 ```powershell
