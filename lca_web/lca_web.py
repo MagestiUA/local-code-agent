@@ -17,6 +17,7 @@ from reflex_base.style import set_color_mode
 from agent import attachments as A
 from agent import config
 from agent import convo
+from agent import chat_projects as CP
 from agent import session as sess
 from agent import topics
 from agent.agent_loop import (_estimate_iters, NUDGE_TEXT, pending_continuation,
@@ -132,6 +133,16 @@ class State(rx.State):
     stopping: bool = False                 # стоп запитано, чекаємо переривання
     context_summary: str = ""              # контекст-памʼять розмови (підсумок)
     session_topics: list[str] = []         # теми (chat), що траплялись у цій сесії
+    # Проекти chat-режиму (аналог Claude/ChatGPT Projects) — лише для mode="chat".
+    projects: list[dict] = []
+    current_project_id: str = ""           # фільтр сайдбара: "" = чати без проекту
+    chat_project_id: str = ""              # проект ВІДКРИТОГО чату (джерело правди для промпту)
+    project_dialog_open: bool = False
+    project_edit_id: str = ""              # "" = створення нового проекту
+    project_name_input: str = ""
+    project_prompt_input: str = ""
+    move_dialog_open: bool = False
+    move_chat_id: str = ""                 # чат, який зараз переносимо між проектами
     # Вкладення (#10) — лише метадані для chips; вміст файлів лежить на диску
     # (agent/attachments.py, тека сесії). Модель читає їх через read_file.
     attachments: list[dict] = []
@@ -233,8 +244,13 @@ class State(rx.State):
 
     @rx.var
     def visible_sessions(self) -> list[dict]:
-        """Чати поточного режиму (Чат/Код роздільні списки)."""
-        return [s for s in self.sessions if s.get("kind", "code") == self.mode]
+        """Чати поточного режиму (Чат/Код роздільні списки). У chat-режимі додатково
+        фільтруємо за поточним проектом сайдбара (current_project_id="" — чати без
+        проекту, як і код-режим, де проектів нема взагалі)."""
+        base = [s for s in self.sessions if s.get("kind", "code") == self.mode]
+        if self.mode != "chat":
+            return base
+        return [s for s in base if (s.get("project_id") or "") == self.current_project_id]
 
     def _attachments_note(self) -> str:
         """Контекстний блок для моделі: імена файлів сесії з ДИСКА (не зі стейджинг-чіпів,
@@ -252,6 +268,7 @@ class State(rx.State):
         self.queued_text = ""
         self.context_summary = ""
         self.session_topics = []
+        self.chat_project_id = ""
         self.attachments = []
         self._load_question(None)
 
@@ -265,6 +282,18 @@ class State(rx.State):
             self._clear_view()
 
     @rx.event
+    def select_project(self, pid: str):
+        """Фільтр сайдбара (chat-режим): показати чати лише цього проекту
+        ("" — без проекту). Якщо відкритий чат не належить новому фільтру —
+        згортаємо вид (той самий патерн, що й set_mode)."""
+        if pid == self.current_project_id:
+            return
+        self.current_project_id = pid
+        cur = next((s for s in self.sessions if s["id"] == self.current_id), None)
+        if not cur or (cur.get("project_id") or "") != pid:
+            self._clear_view()
+
+    @rx.event
     def set_folder_input(self, v: str):
         self.folder_input = v
 
@@ -275,6 +304,7 @@ class State(rx.State):
     @rx.event
     def load_sessions(self):
         self.sessions = sess.list_sessions()
+        self.projects = CP.list_projects()
 
     def _select(self, sid: str):
         s = sess.load_session(sid)
@@ -282,6 +312,7 @@ class State(rx.State):
         self.mode = s.kind
         self.title = s.title
         self.project_root = s.project_root
+        self.chat_project_id = s.project_id
         self.edits = s.permissions.get("edits", "ask")
         self.shell = s.permissions.get("shell", "smart")
         self.plan_first = s.plan_first
@@ -337,6 +368,8 @@ class State(rx.State):
     @rx.event
     def new_chat(self):
         s = sess.new_session("Новий чат", "", kind=self.mode)
+        if self.mode == "chat" and self.current_project_id:
+            s.project_id = self.current_project_id
         sess.save_session(s)
         self.sessions = sess.list_sessions()
         self._select(s.id)
@@ -375,6 +408,91 @@ class State(rx.State):
         sess.delete_session(sid)
         if self.current_id == sid:
             self._clear_view()
+        self.sessions = sess.list_sessions()
+
+    # ── Проекти chat-режиму ──────────────────────────────────────────────────
+    @rx.event
+    def open_move_dialog(self, sid: str):
+        self.move_chat_id = sid
+        self.move_dialog_open = True
+
+    @rx.event
+    def set_move_dialog_open(self, v: bool):
+        self.move_dialog_open = v
+
+    @rx.event
+    def move_chat_to_project(self, pid: str):
+        """Перенести чат у проект pid ("" — винести з проекту/без проекту)."""
+        if self.move_chat_id:
+            s = sess.load_session(self.move_chat_id)
+            s.project_id = pid
+            sess.save_session(s)
+            if self.current_id == self.move_chat_id:
+                self.chat_project_id = pid
+            self.sessions = sess.list_sessions()
+        self.move_dialog_open = False
+        self.move_chat_id = ""
+
+    @rx.event
+    def open_new_project(self):
+        self.project_edit_id = ""
+        self.project_name_input = ""
+        self.project_prompt_input = ""
+        self.project_dialog_open = True
+
+    @rx.event
+    def open_edit_project(self, pid: str):
+        p = CP.load_project(pid)
+        if not p:
+            return
+        self.project_edit_id = p.id
+        self.project_name_input = p.name
+        self.project_prompt_input = p.prompt
+        self.project_dialog_open = True
+
+    @rx.event
+    def set_project_dialog_open(self, v: bool):
+        self.project_dialog_open = v
+
+    @rx.event
+    def set_project_name_input(self, v: str):
+        self.project_name_input = v
+
+    @rx.event
+    def set_project_prompt_input(self, v: str):
+        self.project_prompt_input = v[:CP.PROMPT_MAX_CHARS]
+
+    @rx.event
+    def save_project_dialog(self):
+        name = self.project_name_input.strip()
+        if not name:
+            return
+        if self.project_edit_id:
+            p = CP.load_project(self.project_edit_id)
+            if p:
+                p.name = name
+                p.prompt = self.project_prompt_input
+                CP.save_project(p)
+        else:
+            CP.save_project(CP.new_project(name, self.project_prompt_input))
+        self.projects = CP.list_projects()
+        self.project_dialog_open = False
+
+    @rx.event
+    def delete_project_event(self, pid: str):
+        """Видалити проект. Чати, що належали йому, лишаються — просто без
+        проекту (НЕ видаляємо їхній вміст)."""
+        for s_meta in self.sessions:
+            if (s_meta.get("project_id") or "") == pid:
+                s = sess.load_session(s_meta["id"])
+                s.project_id = ""
+                sess.save_session(s)
+        CP.delete_project(pid)
+        if self.current_project_id == pid:
+            self.current_project_id = ""
+        if self.chat_project_id == pid:
+            self.chat_project_id = ""
+        self.projects = CP.list_projects()
         self.sessions = sess.list_sessions()
 
     @rx.event
@@ -894,11 +1012,14 @@ class State(rx.State):
         read_attachment (attachments_dir = тека вкладень сесії)."""
         async with self:
             cid = self.current_id
+            proj_id = self.chat_project_id
             cur_atts = list(self.messages[-1].get("attachments", []) or []) if self.messages else []
             history = [{"role": m["role"], "content": m["content"]}
                        for m in self.messages
                        if m["role"] in ("user", "assistant")
                        and m.get("kind", "text") in ("text", "answer") and m["content"]][-20:]
+        proj = CP.load_project(proj_id) if proj_id else None
+        project_block = CP.as_system_block(proj.prompt) if proj else ""
         all_names = [n["name"] for n in A.list_saved(cid)]
         other_names = [n for n in all_names if n not in cur_atts]
         # Вшити переліки файлів у ОСТАННЮ user-репліку (поточний хід), якщо файли є.
@@ -910,7 +1031,9 @@ class State(rx.State):
                            attachments_dir=A.session_dir(cid))
         all_topics = await asyncio.to_thread(topics.list_topics)
         topics_note = topics.available_topics_note(all_topics)
-        system = CHAT_SYSTEM + ("\n\n" + topics_note if topics_note else "")
+        # project_block ПЕРШИМ — інструкції проекту задають рамку розмови, тема й
+        # вкладення йдуть як додатковий контекст усередині цієї рамки.
+        system = project_block + CHAT_SYSTEM + ("\n\n" + topics_note if topics_note else "")
         msgs = [{"role": "system", "content": system}] + history
         rounds = await self._estimate_rounds(text, cur_atts or all_names, client,
                                              profile=config.CHAT_EXECUTOR, cid=cid)
@@ -1040,6 +1163,8 @@ class State(rx.State):
         async with self:
             if not self.current_id:
                 s = sess.new_session("Новий чат", "", kind=self.mode)
+                if self.mode == "chat" and self.current_project_id:
+                    s.project_id = self.current_project_id
                 sess.save_session(s)
                 self.sessions = sess.list_sessions()
                 pre = list(self.attachments)            # chips, прикріплені до створення сесії
@@ -1347,6 +1472,11 @@ def session_item(s: dict) -> rx.Component:
             rx.menu.content(
                 rx.menu.item("Перейменувати",
                              on_click=lambda: State.open_rename(s["id"], s["title"])),
+                rx.cond(
+                    s["kind"] == "chat",
+                    rx.menu.item("Перенести…", on_click=lambda: State.open_move_dialog(s["id"])),
+                    rx.fragment(),
+                ),
                 rx.menu.item("Видалити", on_click=lambda: State.delete_chat(s["id"]),
                              class_name="text-red-400"),
             ),
@@ -1371,6 +1501,93 @@ def rename_dialog() -> rx.Component:
         ),
         open=State.rename_open,
         on_open_change=State.set_rename_open,
+    )
+
+
+def project_item(p: dict) -> rx.Component:
+    """Рядок проекту в сайдбарі: клік — фільтр чатів цього проекту; 3-крапки —
+    редагувати промпт / видалити."""
+    active = State.current_project_id == p["id"]
+    return rx.hstack(
+        rx.hstack(
+            rx.icon("folder", size=14, class_name="text-gray-500 shrink-0"),
+            rx.text(p["name"], class_name="text-sm text-gray-200 truncate"),
+            on_click=lambda: State.select_project(p["id"]),
+            class_name="items-center gap-2 grow min-w-0 cursor-pointer",
+        ),
+        rx.menu.root(
+            rx.menu.trigger(
+                rx.icon("ellipsis", size=14,
+                        class_name="text-gray-500 hover:text-gray-200 cursor-pointer shrink-0"),
+            ),
+            rx.menu.content(
+                rx.menu.item("Редагувати", on_click=lambda: State.open_edit_project(p["id"])),
+                rx.menu.item("Видалити", on_click=lambda: State.delete_project_event(p["id"]),
+                             class_name="text-red-400"),
+            ),
+        ),
+        class_name=rx.cond(active, "bg-white/10", "hover:bg-white/5")
+        + " items-center gap-1 px-2 py-1.5 rounded-lg w-full",
+    )
+
+
+def project_dialog() -> rx.Component:
+    """Створення/редагування проекту: назва + промпт (до 5000 символів), що
+    вшивається в системний промпт кожного повідомлення чатів цього проекту."""
+    return rx.dialog.root(
+        rx.dialog.content(
+            rx.dialog.title(rx.cond(State.project_edit_id != "", "Редагувати проект", "Новий проект")),
+            rx.input(placeholder="Назва проекту", value=State.project_name_input,
+                     on_change=State.set_project_name_input, class_name="w-full mt-2"),
+            rx.text_area(
+                placeholder="Інструкції проекту — додаються до кожного повідомлення в чатах "
+                            "цього проекту (до 5000 символів)",
+                value=State.project_prompt_input, on_change=State.set_project_prompt_input,
+                max_length=CP.PROMPT_MAX_CHARS, rows="8", class_name="w-full mt-2",
+            ),
+            rx.text("До 5000 символів — зайве буде обрізано",
+                    class_name="text-xs text-gray-500 mt-1"),
+            rx.flex(
+                rx.button("Скасувати", variant="soft",
+                          on_click=lambda: State.set_project_dialog_open(False)),
+                rx.button("Зберегти", on_click=State.save_project_dialog),
+                spacing="2", justify="end", class_name="mt-3",
+            ),
+        ),
+        open=State.project_dialog_open,
+        on_open_change=State.set_project_dialog_open,
+    )
+
+
+def move_dialog() -> rx.Component:
+    """Перенести чат у проект (чи "без проекту")."""
+    return rx.dialog.root(
+        rx.dialog.content(
+            rx.dialog.title("Перенести чат у проект"),
+            rx.vstack(
+                rx.box(
+                    rx.text("Без проекту", class_name="text-sm text-gray-200"),
+                    on_click=lambda: State.move_chat_to_project(""),
+                    class_name="px-3 py-2 rounded-lg hover:bg-white/5 cursor-pointer w-full",
+                ),
+                rx.foreach(
+                    State.projects,
+                    lambda p: rx.box(
+                        rx.text(p["name"], class_name="text-sm text-gray-200"),
+                        on_click=lambda: State.move_chat_to_project(p["id"]),
+                        class_name="px-3 py-2 rounded-lg hover:bg-white/5 cursor-pointer w-full",
+                    ),
+                ),
+                class_name="w-full gap-1 mt-2 max-h-72 overflow-y-auto",
+            ),
+            rx.flex(
+                rx.button("Скасувати", variant="soft",
+                          on_click=lambda: State.set_move_dialog_open(False)),
+                spacing="2", justify="end", class_name="mt-3",
+            ),
+        ),
+        open=State.move_dialog_open,
+        on_open_change=State.set_move_dialog_open,
     )
 
 
@@ -1466,13 +1683,48 @@ def settings_dialog() -> rx.Component:
     )
 
 
+def project_section() -> rx.Component:
+    """Проекти chat-режиму (аналог Claude/ChatGPT Projects): список + "+ Новий
+    проект". Лише mode="chat" — код-режим має власну прив'язку до робочої теки."""
+    return rx.cond(
+        State.is_chat,
+        rx.fragment(
+            rx.hstack(
+                rx.text("Проекти", class_name="text-xs text-gray-500 uppercase tracking-wide"),
+                rx.spacer(),
+                rx.icon("plus", size=13, on_click=State.open_new_project,
+                        class_name="text-gray-500 hover:text-gray-200 cursor-pointer"),
+                class_name="items-center mt-5 mb-1 px-2",
+            ),
+            rx.cond(
+                State.projects,
+                rx.vstack(rx.foreach(State.projects, project_item), class_name="w-full gap-0.5"),
+                rx.text("Поки немає проектів", class_name="text-sm text-gray-500 px-2"),
+            ),
+        ),
+        rx.fragment(),
+    )
+
+
 def sidebar() -> rx.Component:
     return rx.flex(
         settings_dialog(),
         mode_switch(),
         nav_item("plus", "Новий чат", State.new_chat),
-        rx.text("Recents", class_name="text-xs text-gray-500 uppercase tracking-wide "
-                                       "mt-5 mb-1 px-2"),
+        project_section(),
+        rx.cond(
+            State.is_chat & (State.current_project_id != ""),
+            rx.hstack(
+                rx.icon("arrow-left", size=12),
+                rx.text("Усі чати", class_name="text-xs"),
+                on_click=lambda: State.select_project(""),
+                class_name="items-center gap-1 text-gray-500 hover:text-gray-200 cursor-pointer "
+                           "px-2 mt-3",
+            ),
+            rx.fragment(),
+        ),
+        rx.text("Recents", class_name=rx.cond(State.is_chat, "mt-2", "mt-5")
+                + " text-xs text-gray-500 uppercase tracking-wide mb-1 px-2"),
         rx.vstack(
             rx.cond(
                 State.visible_sessions,
@@ -1916,6 +2168,8 @@ def index() -> rx.Component:
         sidebar(),
         main_area(),
         rename_dialog(),
+        project_dialog(),
+        move_dialog(),
         confirm_dialog(),
         class_name="h-screen w-screen overflow-hidden",
         style={"backgroundColor": BG},

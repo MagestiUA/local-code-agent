@@ -33,6 +33,7 @@ class Session:
     pending_question: dict | None = None                  # питання планувальника, що очікує відповіді
     context_summary: str = ""                             # стислий підсумок розмови (контекст-памʼять)
     topics: list = field(default_factory=list)            # назви тем (chat), що траплялись у цій сесії
+    project_id: str = ""                                  # chat-проект (chat_projects.py), "" — жодного
     messages: list = field(default_factory=list)          # [{role, content, kind, meta}]
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
@@ -116,7 +117,7 @@ def list_sessions(base: str | Path | None = None) -> list[dict]:
             d = json.loads(p.read_text(encoding="utf-8"))
             out.append({"id": d["id"], "title": d["title"],
                         "project_root": d["project_root"], "updated": d.get("updated"),
-                        "kind": d.get("kind", "code")})
+                        "kind": d.get("kind", "code"), "project_id": d.get("project_id", "")})
         except Exception:
             pass
     return out
