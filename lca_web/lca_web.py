@@ -1758,20 +1758,22 @@ def message_bubble(m: dict) -> rx.Component:
                         rx.el.summary(
                             rx.cond(m["kind"] == "step", "хід виконання", "Роздуми моделі"),
                             class_name="text-xs text-gray-500 cursor-pointer select-none"),
-                        rx.markdown(m["thinking"]),
-                        class_name="mb-2 border-l-2 border-white/10 pl-2 max-h-80 overflow-y-auto",
+                        rx.markdown(m["thinking"], class_name="max-w-full overflow-x-auto break-words"),
+                        class_name="mb-2 border-l-2 border-white/10 pl-2 max-h-80 max-w-full "
+                                   "overflow-y-auto overflow-x-hidden",
                     ),
                     rx.fragment(),
                 ),
-                rx.markdown(m["content"]),
+                rx.markdown(m["content"], class_name="max-w-full overflow-x-auto break-words"),
                 style={"fontSize": State.chat_font_px},
+                class_name="min-w-0 max-w-full",
             ),
         ),
         # user — компактна бульбашка справа; assistant — на всю ширину (вирівняно з полем вводу).
         class_name=rx.cond(
             mine,
             "self-end bg-white/10 max-w-[85%]",
-            "self-start bg-white/[0.03] w-full",
+            "self-start bg-white/[0.03] w-full min-w-0",
         ) + " rounded-2xl px-4 py-2.5",
     )
 
@@ -1837,14 +1839,15 @@ def streaming_bubble() -> rx.Component:
             rx.el.details(
                 rx.el.summary("Роздуми моделі",
                               class_name="text-xs text-gray-500 cursor-pointer select-none"),
-                rx.markdown(State.stream_thinking),
-                class_name="mb-2 border-l-2 border-white/10 pl-2 max-h-80 overflow-y-auto",
+                rx.markdown(State.stream_thinking, class_name="max-w-full overflow-x-auto break-words"),
+                class_name="mb-2 border-l-2 border-white/10 pl-2 max-h-80 max-w-full "
+                           "overflow-y-auto overflow-x-hidden",
                 open=True,
             ),
             rx.fragment(),
         ),
-        rx.markdown(State.stream_content),
-        class_name="self-start bg-white/[0.03] rounded-2xl px-4 py-2.5 w-full",
+        rx.markdown(State.stream_content, class_name="max-w-full overflow-x-auto break-words"),
+        class_name="self-start bg-white/[0.03] rounded-2xl px-4 py-2.5 w-full min-w-0",
         style={"fontSize": State.chat_font_px},
     )
 
@@ -1858,7 +1861,7 @@ def chat_view() -> rx.Component:
         rx.cond(State.has_question, question_bar(), rx.fragment()),
         id="chat-scroll",
         on_mount=rx.call_script(SCROLL_SETUP_JS),
-        class_name="w-full flex-1 overflow-y-auto px-[1cm] py-6 gap-3",
+        class_name="w-full flex-1 overflow-y-auto overflow-x-hidden min-w-0 px-[1cm] py-6 gap-3",
         # scrollbar-gutter: stable — скролбар завжди резервує місце праворуч, тож ширина
         # контенту стабільна; поле вводу компенсує ту саму ширину через --sbw (нижче).
         style={"fontSize": State.chat_font_px, "scrollbarGutter": "stable"},
