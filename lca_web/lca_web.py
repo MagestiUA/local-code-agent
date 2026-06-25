@@ -17,7 +17,7 @@ from agent import attachments as A
 from agent import config
 from agent import convo
 from agent import session as sess
-from agent.agent_loop import _estimate_iters
+from agent.agent_loop import _estimate_iters, _looks_like_leaked_tool_call
 from agent.answerer import build_context
 from agent.intent import classify_intent
 from agent.llm import OllamaClient
@@ -580,7 +580,7 @@ class State(rx.State):
         на async-паузу — діалог показується з контексту ЦІЄЇ події (дельта доходить), а
         не з відірваної корутини. Додає ОДНЕ повідомлення-крок із катом «хід виконання».
         Логіку дублюємо з agent_loop.run_step (той лишається для headless/тестів)."""
-        from agent.agent_loop import SYSTEM as EXEC_SYSTEM, _args, _looks_like_leaked_tool_call
+        from agent.agent_loop import SYSTEM as EXEC_SYSTEM, _args
         reg = default_registry()
         client = ctx.client
         user = (f"Контекст:\n{context}\n\n" if context else "") + f"Крок:\n{step_text}"
@@ -732,11 +732,27 @@ class State(rx.State):
         tools = [t for t in reg.schema() if t["function"]["name"] in self._READONLY_TOOLS]
 
         if gather_first:
+            nudged = False
             for _ in range(max_rounds):
                 msg = await asyncio.to_thread(
                     lambda: client.chat(msgs, tools=tools, profile=config.EXECUTOR))
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls:
+                    content = (msg.get("content") or "").strip()
+                    # Якщо модель не викликала жоден тул і відповідь порожня/просочена
+                    # (XML-теги замість structured tool_calls) — раніше цикл просто
+                    # `break`-ався і йшов на фінальний синтез БЕЗ жодних зібраних даних
+                    # (типово — вкладення взагалі не прочитане). Звідси "(порожня
+                    # відповідь)" на живому кейсі з великим paste-вкладенням. Нюджимо
+                    # РІВНО ОДИН раз; якщо контент непорожній і не просочений — це
+                    # справді "досить зібрано, йду відповідати" (валідний ранній вихід).
+                    if not nudged and (not content or _looks_like_leaked_tool_call(content)):
+                        nudged = True
+                        msgs.append({"role": "user", "content":
+                            "Виклич потрібний інструмент (напр. read_attachment) як "
+                            "справжній tool/function call — не просто опиши намір і "
+                            "НЕ пиши його як текст/XML-теги у відповіді."})
+                        continue
                     break
                 msgs.append({"role": "assistant", "content": msg.get("content", ""),
                              "tool_calls": tool_calls})
