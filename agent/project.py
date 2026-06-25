@@ -17,7 +17,7 @@ DOC_NAME = "AGENT.md"
 SKIP_DIRS = {
     ".git", ".venv", "venv", "__pycache__", "node_modules", ".idea", ".agent",
     "dist", "build", ".mypy_cache", ".pytest_cache", "scratch", ".web", ".states",
-    "reflex.lock", ".attachments",
+    "reflex.lock", ".attachments", ".claude",
 }
 
 DRAFT_SYSTEM = (

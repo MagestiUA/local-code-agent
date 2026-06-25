@@ -1127,22 +1127,22 @@ class State(rx.State):
             self.status = "Виконую план…"
             _STOP_EVENTS[self.current_id] = threading.Event()   # свіжа стоп-подія на запит
             root, cid = self.project_root, self.current_id
+            # Кнопки «Виконати/Відхилити» прив'язані до has_pending — ховаємо їх ОДРАЗУ
+            # на старті (план уже беремо з диска нижче), інакше вони висять увесь час
+            # виконання й зникають лише наприкінці.
+            self.has_pending = False
+            s0 = sess.load_session(cid)
+            plan = s0.get_pending_plan()
+            s0.clear_pending_plan()
+            sess.save_session(s0)
 
         client = await asyncio.to_thread(get_client)
-        s = sess.load_session(cid)
-        plan = s.get_pending_plan()
         outcome = ""
         try:
             outcome = await self._execute_steps(plan, root, client)
         except Exception as e:
             async with self:
                 self._append("assistant", f"⚠ Помилка виконання: {e}", "note")
-        finally:
-            async with self:
-                s2 = sess.load_session(self.current_id)
-                s2.clear_pending_plan()
-                sess.save_session(s2)
-                self.has_pending = False
         if (outcome or "").strip():
             async with self:
                 self.status = "Оновлюю памʼять…"

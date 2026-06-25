@@ -33,6 +33,11 @@ SYSTEM = (
     "If a run_shell command FAILS, read the error and issue a CORRECTED command — do "
     "NOT repeat the same failing command. (E.g. git: stage with 'git add -A', then "
     "commit with 'git commit -m \"message\"' — '-m' belongs to commit, NOT to add.)\n"
+    "NEVER invent data, lists, or mechanisms that aren't shown in your context (e.g. a "
+    "hardcoded list of app names/IDs when the project already has a search/lookup "
+    "mechanism for that). If the step implies an existing project mechanism should be "
+    "reused, use read_file/list_dir FIRST to find and use the real one — do not fall "
+    "back to a made-up substitute.\n"
     "When the step is done, reply with a SHORT confirmation and NO tool call. "
     "Reply in the user's language."
 )
