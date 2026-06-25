@@ -5,6 +5,7 @@ G3: керування сесіями через бекенд (agent/session.py)
 Прив'язки runner (answer/shell/plan/edit) — G4.
 """
 import asyncio
+import re
 import threading
 import time
 from dataclasses import replace
@@ -17,6 +18,7 @@ from agent import attachments as A
 from agent import config
 from agent import convo
 from agent import session as sess
+from agent import topics
 from agent.agent_loop import (_estimate_iters, NUDGE_TEXT, pending_continuation,
                               recover_tool_calls, should_nudge)
 from agent.answerer import build_context
@@ -129,6 +131,7 @@ class State(rx.State):
     queued_text: str = ""                  # повідомлення, що чекає, поки модель зайнята
     stopping: bool = False                 # стоп запитано, чекаємо переривання
     context_summary: str = ""              # контекст-памʼять розмови (підсумок)
+    session_topics: list[str] = []         # теми (chat), що траплялись у цій сесії
     # Вкладення (#10) — лише метадані для chips; вміст файлів лежить на диску
     # (agent/attachments.py, тека сесії). Модель читає їх через read_file.
     attachments: list[dict] = []
@@ -248,6 +251,7 @@ class State(rx.State):
         self.has_pending = False
         self.queued_text = ""
         self.context_summary = ""
+        self.session_topics = []
         self.attachments = []
         self._load_question(None)
 
@@ -285,6 +289,7 @@ class State(rx.State):
         self.messages = [{"thinking": "", "attachments": [], **m} for m in s.messages]
         self.has_pending = s.pending_plan is not None
         self.context_summary = s.context_summary
+        self.session_topics = list(s.topics)
         self.attachments = []     # чіпи — стейджинг до відправки; вкладення сесії на диску
         self._load_question(s.pending_question)
 
@@ -697,10 +702,43 @@ class State(rx.State):
         return body, thinking, tool_calls
 
     # Тули, доступні read-only режимам (чат / answer): пошук + читання файлів/вкладень.
-    _READONLY_TOOLS = ("web_search", "read_file", "list_dir", "read_attachment")
+    _READONLY_TOOLS = ("web_search", "read_file", "list_dir", "read_attachment", "read_topic")
 
-    async def _dispatch_tool_calls(self, tool_calls: list, msgs: list, reg, tctx):
-        """Виконати tool_calls: дописати результати в msgs + показати кроки в чаті."""
+    # Заголовок read_attachment, коли файл читається частинами (toolkit.h_read_attachment):
+    # "=== name (OFFSET-END з TOTAL) ===" — з'являється лише коли total > CHUNK_SIZE.
+    _PAGINATED_HEADER_RE = re.compile(r"^=== (.+?) \(\d+-\d+ з \d+\) ===\n", re.MULTILINE)
+    # Хвіст-підказка "лишилось N символів... offset=X)]" — лишаємо як є, щоб
+    # agent_loop.pending_continuation продовжував працювати й після заміни на дайджест.
+    _CONTINUATION_SUFFIX_RE = re.compile(r"\n\n…\[лишилось .*?\]$", re.DOTALL)
+
+    async def _digest_attachment_chunk(self, name: str, raw_result: str,
+                                       memory: dict[str, str], client, profile: dict) -> str:
+        """Якщо raw_result — шматок ВЕЛИКОГО вкладення (пагінація), зливає його в
+        накопичувальний дайджест (agent.convo.update_digest) і повертає дайджест +
+        той самий continuation-хвіст замість сирого шматка — щоб контекст не
+        роздувався накопиченням сирих шматків, а pending_continuation і далі бачив
+        offset-підказку. Для звичайних (непагінованих) результатів — повертає
+        raw_result без змін. profile: та сама модель, що й gather-фаза (chat -> gemma)."""
+        header_match = self._PAGINATED_HEADER_RE.match(raw_result)
+        if not header_match:
+            return raw_result
+        body = raw_result[header_match.end():]
+        suffix_match = self._CONTINUATION_SUFFIX_RE.search(body)
+        suffix = suffix_match.group(0) if suffix_match else ""
+        chunk_text = body[:suffix_match.start()] if suffix_match else body
+        prev = memory.get(name, "")
+        digest = await asyncio.to_thread(
+            lambda: convo.update_digest(prev, chunk_text, client, profile=profile))
+        memory[name] = digest
+        return f"=== {name} (дайджест прочитаного дотепер) ===\n{digest}{suffix}"
+
+    async def _dispatch_tool_calls(self, tool_calls: list, msgs: list, reg, tctx,
+                                   digest_memory: dict[str, str] | None = None, client=None,
+                                   digest_profile: dict = config.EXECUTOR):
+        """Виконати tool_calls: дописати результати в msgs + показати кроки в чаті.
+        digest_memory (опційно): якщо передано — шматки великих вкладень (read_attachment
+        пагінація) зливаються в дайджест (convo.update_digest) замість накопичення сирими
+        шматками в контексті. Без цього параметра — поведінка як була."""
         import json as _json
         for call in tool_calls:
             name = call.get("function", {}).get("name", "")
@@ -714,17 +752,28 @@ class State(rx.State):
             async with self:
                 self.status = f"{name}: {label}"[:60]
             result = await asyncio.to_thread(lambda n=name, a=args: reg.dispatch(n, a, tctx))
-            msgs.append({"role": "tool", "content": result})
+            shown = result
+            if digest_memory is not None and name == "read_attachment" and client is not None:
+                async with self:
+                    self.status = f"Узагальнюю прочитане ({label})…"
+                shown = await self._digest_attachment_chunk(label, result, digest_memory, client,
+                                                             digest_profile)
+            msgs.append({"role": "tool", "content": shown})
             async with self:
-                self._append("assistant", f"🔧 {name} · {label}", "step", thinking=result)
+                self._append("assistant", f"🔧 {name} · {label}", "step", thinking=shown)
 
     async def _run_tool_chat(self, msgs: list, tctx: ToolContext, client,
-                             max_rounds: int = 6, gather_first: bool = False) -> str:
+                             max_rounds: int = 6, gather_first: bool = False,
+                             gather_profile: dict = config.EXECUTOR) -> str:
         """Тул-цикл для read-only режимів.
 
-        gather_first=True (є прикріплені файли): фаза ЗБОРУ йде з think=OFF (EXECUTOR) —
-        gemma надійно емітить tool_calls (read_attachment), а не «думає» про них без
-        виклику; потім ОДИН фінальний синтез з think=ON (стрім, живий лічильник).
+        gather_first=True (є прикріплені файли): фаза ЗБОРУ йде з think=OFF
+        (gather_profile — за дефолтом EXECUTOR/Qwen для answer-режиму /КОД-аналізу;
+        chat-режим передає config.CHAT_EXECUTOR/gemma — інакше chat випадково
+        тягнув би кодинг-модель лише тому, що think=off надійніший для tool_calls)
+        — модель надійно емітить tool_calls (read_attachment), а не «думає» про них
+        без виклику; потім ОДИН фінальний синтез з think=ON (PLANNER/gemma, стрім,
+        живий лічильник).
 
         gather_first=False (простий чат/web_search): think=ON стрім-цикл як є; якщо
         раунди вичерпано на тулах — форсований фінал без тулів."""
@@ -733,9 +782,10 @@ class State(rx.State):
 
         if gather_first:
             nudged = False
+            digest_memory: dict[str, str] = {}   # name -> накопичувальний дайджест великого файлу
             for _ in range(max_rounds):
                 msg = await asyncio.to_thread(
-                    lambda: client.chat(msgs, tools=tools, profile=config.EXECUTOR))
+                    lambda: client.chat(msgs, tools=tools, profile=gather_profile))
                 tool_calls, recovered = recover_tool_calls(msg)
                 if not tool_calls:
                     content = (msg.get("content") or "").strip()
@@ -759,7 +809,9 @@ class State(rx.State):
                         break
                 msgs.append({"role": "assistant", "content": "" if recovered else msg.get("content", ""),
                              "tool_calls": tool_calls})
-                await self._dispatch_tool_calls(tool_calls, msgs, reg, tctx)
+                await self._dispatch_tool_calls(tool_calls, msgs, reg, tctx,
+                                                digest_memory=digest_memory, client=client,
+                                                digest_profile=gather_profile)
             async with self:
                 self.status = "Формулюю відповідь…"
             body, thinking, _ = await self._run_stream(
@@ -791,16 +843,17 @@ class State(rx.State):
                          "answer", thinking=thinking)
         return body
 
-    async def _estimate_rounds(self, text: str, names: list, client) -> int:
+    async def _estimate_rounds(self, text: str, names: list, client,
+                               profile: dict = config.EXECUTOR) -> int:
         """Адаптивний ліміт раундів тул-циклу. Коли є прикріплені файли — оцінюємо
         через _estimate_iters (модель каже n тул-викликів → max(6, n*2)), щоб ліміт
         масштабувався під кількість/складність файлів, а не впирався в хардкод. Без
         файлів — дефолт 6 (ліміт усе одно не зв'язує простий чат: він завершується
-        першим раундом без тулів)."""
+        першим раундом без тулів). profile: chat-режим передає CHAT_EXECUTOR (gemma)."""
         if not names:
             return 6
         return await asyncio.to_thread(
-            lambda: _estimate_iters(text, "files: " + "; ".join(names), client))
+            lambda: _estimate_iters(text, "files: " + "; ".join(names), client, profile=profile))
 
     @staticmethod
     def _inject_files(content: str, cur_names: list, other_names: list) -> str:
@@ -841,12 +894,20 @@ class State(rx.State):
         tctx = ToolContext(root=A.session_dir(cid),
                            permissions={"edits": "off", "shell": "off"}, client=client,
                            attachments_dir=A.session_dir(cid))
-        msgs = [{"role": "system", "content": CHAT_SYSTEM}] + history
-        rounds = await self._estimate_rounds(text, cur_atts or all_names, client)
-        # think=off-збір, коли в сесії Є файли (нові чи старі) — щоб модель НАДІЙНО їх
-        # читала (think=on часто «думає» про read_attachment, але не викликає). Чистий
-        # чат без файлів → think=on-стрім без зайвого збору.
-        return await self._run_tool_chat(msgs, tctx, client, rounds, gather_first=bool(all_names))
+        all_topics = await asyncio.to_thread(topics.list_topics)
+        topics_note = topics.available_topics_note(all_topics)
+        system = CHAT_SYSTEM + ("\n\n" + topics_note if topics_note else "")
+        msgs = [{"role": "system", "content": system}] + history
+        rounds = await self._estimate_rounds(text, cur_atts or all_names, client,
+                                             profile=config.CHAT_EXECUTOR)
+        # think=off-збір, коли в сесії Є файли ЧИ доступні теми минулих розмов — щоб
+        # модель НАДІЙНО викликала read_attachment/read_topic (think=on часто «думає»
+        # про тул, але не викликає). Чистий чат без файлів/тем → think=on-стрім без
+        # зайвого збору. gather_profile=CHAT_EXECUTOR (gemma) — chat-режим не торкає
+        # кодинг-модель.
+        return await self._run_tool_chat(msgs, tctx, client, rounds,
+                                         gather_first=bool(all_names or all_topics),
+                                         gather_profile=config.CHAT_EXECUTOR)
 
     # Системний промпт answer-режиму В ТУЛ-ЦИКЛІ: на відміну від answerer.SYSTEM, явно
     # каже про read_file/list_dir — інакше модель «просить користувача прислати файли»
@@ -902,15 +963,39 @@ class State(rx.State):
         async with self:
             cur = self.context_summary
             cid = self.current_id
+            chat = self.mode == "chat"
+            kind = "chat" if chat else "code"
+            cur_topics = list(self.session_topics)
+        # chat: загальний підсумок розмови менше потрібен у деталях (деталі живуть у
+        # темах нижче) — зменшуємо бюджет умовно втричі, як домовлено з користувачем.
+        budget = convo.BUDGET_CHARS // 3 if chat else convo.BUDGET_CHARS
         new = await asyncio.to_thread(
-            lambda: convo.update_summary(cur, user_text, outcome, client))
+            lambda: convo.update_summary(cur, user_text, outcome, client, budget=budget, kind=kind))
+        new_topics = cur_topics
+        if chat:
+            new_topics = await asyncio.to_thread(
+                lambda: self._update_topic(user_text, outcome, cur_topics, client))
         async with self:
             if self.current_id == cid:                # та сама сесія — оновити й у State
                 self.context_summary = new
+                self.session_topics = new_topics
             if cid:                                   # у файл — завжди в сесію-походження
                 s = sess.load_session(cid)
                 s.context_summary = new
+                s.topics = new_topics
                 sess.save_session(s)
+
+    def _update_topic(self, user_text: str, outcome: str, cur_topics: list[str], client) -> list[str]:
+        """Класифікувати цей хід розмови за темою (нова чи існуюча — список тем
+        СПІЛЬНИЙ для всього chat-режиму, не лише цієї сесії), злити в нотатку теми
+        й зберегти на диск. Повертає оновлений список тем ЦІЄЇ сесії (для підказки
+        моделі в наступних ходах). Синхронна (LLM-виклики) — викликати з to_thread."""
+        existing = topics.list_topics()
+        name = topics.classify_topic(user_text, outcome, existing, client, profile=config.CHAT_EXECUTOR)
+        prev = topics.load_topic(name)
+        note = topics.update_topic_note(prev, user_text, outcome, client, profile=config.CHAT_EXECUTOR)
+        topics.save_topic(name, note)
+        return cur_topics if name in cur_topics else [*cur_topics, name]
 
     @rx.event
     def stop_generation(self):

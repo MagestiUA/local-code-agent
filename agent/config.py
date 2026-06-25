@@ -1,9 +1,15 @@
 """Константи й профілі агента.
 
-Два профілі ролей, кожен зі своєю моделлю (за нашим бенчмарком — Qwen3-Coder сильніша
-саме в кодингу, gemma4 краще тримає якість на максимальному контексті):
-  EXECUTOR — механічне виконання (tool-loop, код): думання ВИМКНЕНО, модель Qwen3-Coder.
-  PLANNER  — декомпозиція й аналіз: думання УВІМКНЕНО, модель gemma4.
+Профілі ролей, кожен зі своєю моделлю (за нашим бенчмарком — Qwen3-Coder сильніша
+саме в кодингу, gemma4 краще тримає якість на максимальному контексті й для
+аналітичних/чат-розмов):
+  EXECUTOR      — механічне виконання (tool-loop, КОД): думання ВИМКНЕНО, Qwen3-Coder.
+  PLANNER       — декомпозиція й аналіз (КОД): думання УВІМКНЕНО, gemma4.
+  CHAT_EXECUTOR — той самий think=off/DRY-режим (надійний tool-calling для
+                  read_attachment/read_topic), але для CHAT-режиму — модель gemma4,
+                  НЕ Qwen. Без цього chat-режим випадково тягнув би модель EXECUTOR
+                  (Qwen, призначену для коду) лише тому, що used think=off для
+                  надійного виклику тулів.
 
 num_ctx=131072 — sweet spot за бенчмарком q4_0+flash attention (gemma4 113.5→108.5
 t/s, лише -4% проти 65536; за 262144 падіння вже різке — лишаємо як опцію не дефолт).
@@ -49,3 +55,4 @@ EXECUTOR = {"think": False, "num_ctx": 131072, "temperature": 0.2, "options": _D
             "model": "qwen3-coder-agent:30b"}
 PLANNER  = {"think": True,  "num_ctx": 131072, "temperature": 0.3,
             "model": MODEL}
+CHAT_EXECUTOR = {**EXECUTOR, "model": MODEL}   # think=off/DRY як EXECUTOR, але gemma4

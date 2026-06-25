@@ -32,6 +32,7 @@ class Session:
     pending_plan: dict | None = None                      # план, що очікує виконання
     pending_question: dict | None = None                  # питання планувальника, що очікує відповіді
     context_summary: str = ""                             # стислий підсумок розмови (контекст-памʼять)
+    topics: list = field(default_factory=list)            # назви тем (chat), що траплялись у цій сесії
     messages: list = field(default_factory=list)          # [{role, content, kind, meta}]
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)

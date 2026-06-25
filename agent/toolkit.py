@@ -144,6 +144,29 @@ def h_read_attachment(args, ctx):
     return f"{header}\n{chunk}"
 
 
+def h_read_topic(args, ctx):
+    """Прочитати нотатку теми (chat-режим, спільна памʼять між чатами — agent.topics).
+    Нечіткий пошук за іменем, як read_attachment."""
+    from . import topics
+    q = (args.get("name") or "").strip()
+    existing = topics.list_topics()
+    if not existing:
+        return "немає збережених тем"
+    match = next((t for t in existing if t == q), None)
+    if not match and q:
+        ql = q.lower()
+        cand = ([t for t in existing if t.lower() == ql]
+                or [t for t in existing if ql in t.lower()]
+                or [t for t in existing if t.lower() in ql])
+        match = cand[0] if cand else None
+    if not match:
+        return f"тема '{q}' не знайдена. Існуючі теми: {', '.join(existing)}"
+    content = topics.load_topic(match)
+    if len(content) > 8000:
+        content = content[:8000] + f"\n\n…[обрізано: показано 8000 з {len(content)} символів]"
+    return f"=== тема: {match} ===\n{content}"
+
+
 def h_write_file(args, ctx):
     rel = (args.get("path") or "").strip()
     if not rel:
@@ -270,4 +293,10 @@ def default_registry() -> ToolRegistry:
                     {"query": {"type": "string", "description": "пошуковий запит"},
                      "max_results": {"type": "integer", "description": "скільки результатів, типово 5"}},
                     ["query"], h_web_search))
+    r.register(Tool("read_topic",
+                    "Прочитати нотатку попередньої аналітичної розмови за темою (chat-режим, "
+                    "СПІЛЬНА памʼять між усіма чатами). Викликай, коли ЦЯ розмова продовжує "
+                    "тему зі списку доступних тем у контексті.",
+                    {"name": {"type": "string", "description": "назва теми"}},
+                    ["name"], h_read_topic))
     return r

@@ -56,14 +56,16 @@ _ESTIMATE_SYSTEM = (
 )
 
 
-def _estimate_iters(step_text: str, context: str, client: OllamaClient) -> int:
-    """Спитати модель скільки тул-викликів потрібно для кроку → повернути n*2 (мін 6)."""
+def _estimate_iters(step_text: str, context: str, client: OllamaClient,
+                    profile: dict = config.EXECUTOR) -> int:
+    """Спитати модель скільки тул-викликів потрібно для кроку → повернути n*2 (мін 6).
+    profile: chat-режим передає CHAT_EXECUTOR (gemma)."""
     user = (f"Context:\n{context}\n\n" if context else "") + f"Step:\n{step_text}"
     try:
         msg = client.chat(
             [{"role": "system", "content": _ESTIMATE_SYSTEM},
              {"role": "user", "content": user}],
-            profile=config.EXECUTOR, fmt=_ESTIMATE_SCHEMA,
+            profile=profile, fmt=_ESTIMATE_SCHEMA,
         )
         n = json.loads(msg.get("content") or "{}").get("n", 6)
         # Запас на самокорекцію: слабка модель часто витрачає 2-3 ітерації на невдалі

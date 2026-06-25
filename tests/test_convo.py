@@ -42,7 +42,39 @@ def main() -> None:
     assert convo.as_context("") == ""
     assert "підсумок" in convo.as_context("- щось")
 
-    print("OK: convo — епізоди, дописування, стиснення за бюджетом, порожній епізод, as_context")
+    # kind="chat" використовує ОКРЕМИЙ (не кодинг-орієнтований) промпт — перевіряємо,
+    # що системний промпт дійсно різний для code/chat (а не просто ігнорується kind).
+    captured = {}
+    class CapturingStub:
+        def chat(self, messages, tools=None, profile=None, fmt=None):
+            captured["system"] = messages[0]["content"]
+            return {"content": "епізод"}
+    convo.summarize_turn("питання", "відповідь", client=CapturingStub(), kind="chat")
+    chat_sys = captured["system"]
+    convo.summarize_turn("питання", "відповідь", client=CapturingStub(), kind="code")
+    code_sys = captured["system"]
+    assert chat_sys != code_sys
+    assert "files" not in chat_sys.lower() and "function" not in chat_sys.lower()
+    assert "files" in code_sys.lower() or "functions" in code_sys.lower()
+
+    # update_digest: перший шматок -> дайджест; другий шматок + дайджест -> новий дайджест
+    d1 = convo.update_digest("", "шматок 1: подія А сталась через Б",
+                             client=Stub(["Подія А сталась через Б."]))
+    assert "Подія А" in d1
+
+    # модель ЛУНАЄ заголовок промпту замість чистого тексту (живий кейс) -> обрізаємо
+    d_echo = convo.update_digest("", "шматок", client=Stub(["Поточний дайджест:\nЧистий текст."]))
+    assert d_echo == "Чистий текст.", repr(d_echo)
+    d2 = convo.update_digest(d1, "шматок 2: подія В сталась через А",
+                             client=Stub(["Подія А -> Б -> В."]))
+    assert "В" in d2
+    # переповнення бюджету дайджесту -> другий (стискаючий) прохід
+    d3 = convo.update_digest("x" * 200, "ще шматок",
+                             client=Stub(["y" * 200_000, "СТИСНУТО"]), budget=1000)
+    assert d3 == "СТИСНУТО", repr(d3)
+
+    print("OK: convo — епізоди, дописування, стиснення за бюджетом, порожній епізод, as_context, "
+          "chat/code kind різні промпти, update_digest шматків")
 
 
 if __name__ == "__main__":
