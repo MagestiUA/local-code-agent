@@ -157,6 +157,7 @@ class State(rx.State):
     tok_out: int = 0
     tok_eval_ns: int = 0
     tok_tps: float = 0.0
+    tok_model: str = ""
 
     @rx.event
     def set_task(self, v: str):
@@ -181,6 +182,7 @@ class State(rx.State):
     def _reset_tokens(self):
         self.tok_prompt = self.tok_out = self.tok_eval_ns = 0
         self.tok_tps = 0.0
+        self.tok_model = ""
 
     def _recompute_tps(self):
         self.tok_tps = round(self.tok_out / (self.tok_eval_ns / 1e9), 1) if self.tok_eval_ns else 0.0
@@ -189,6 +191,9 @@ class State(rx.State):
         self.tok_prompt += sum(s.get("prompt", 0) for s in stats)
         self.tok_out += sum(s.get("out", 0) for s in stats)
         self.tok_eval_ns += sum(s.get("eval_ns", 0) for s in stats)
+        for s in stats:
+            if s.get("model"):
+                self.tok_model = s["model"]      # остання модель, що відповідала
         self._recompute_tps()
 
     @rx.var
@@ -196,7 +201,8 @@ class State(rx.State):
         # ctx (prompt_eval_count) Ollama віддає лише у фінальному чанку — поки невідомо
         # й модель ще працює, показуємо «…», а не оманливий 0.
         ctx = "…" if (self.busy and self.tok_prompt == 0) else str(self.tok_prompt)
-        return f"↑{ctx} ctx · ↓{self.tok_out} out · {self.tok_tps} tok/s"
+        model = f"{self.tok_model} · " if self.tok_model else ""
+        return f"{model}↑{ctx} ctx · ↓{self.tok_out} out · {self.tok_tps} tok/s"
 
     @rx.var
     def ui_font_js(self) -> str:
@@ -574,7 +580,7 @@ class State(rx.State):
         на async-паузу — діалог показується з контексту ЦІЄЇ події (дельта доходить), а
         не з відірваної корутини. Додає ОДНЕ повідомлення-крок із катом «хід виконання».
         Логіку дублюємо з agent_loop.run_step (той лишається для headless/тестів)."""
-        from agent.agent_loop import SYSTEM as EXEC_SYSTEM, _args
+        from agent.agent_loop import SYSTEM as EXEC_SYSTEM, _args, _looks_like_leaked_tool_call
         reg = default_registry()
         client = ctx.client
         user = (f"Контекст:\n{context}\n\n" if context else "") + f"Крок:\n{step_text}"
@@ -594,19 +600,24 @@ class State(rx.State):
                 stats.append(dict(client.last_stats))
             calls = msg.get("tool_calls") or []
             if not calls:
-                # Модель «розповіла», але не діяла. Якщо крок ще нічого не зробив —
-                # підштовхуємо РІВНО ОДИН раз викликати інструмент (типова слабкість
-                # gemma: думає про тул, але не емітить tool_call). Інакше крок тихо
-                # завершувався б без жодної реальної дії.
-                if not actions and not nudged:
+                content = (msg.get("content") or "").strip()
+                # Підштовхуємо РІВНО ОДИН раз, незалежно від того, чи вже були дії
+                # раніше у цьому кроці (раніше нюджалось лише на ПЕРШІЙ спробі — тож
+                # якщо модель спочатку щось почитала, а потім видала порожню/просочену
+                # відповідь, крок тихо "завершувався" без результату — саме так стався
+                # живий кейс на account_test_14.py). НЕ ехо-имо зламаний/порожній текст
+                # назад як assistant — модель копіює власну попередню відповідь і
+                # застрягає в тому самому виводі (перевірено живцем у agent_loop).
+                if not nudged and (not content or _looks_like_leaked_tool_call(content)):
                     nudged = True
-                    messages.append({"role": "assistant", "content": msg.get("content", "")})
                     messages.append({"role": "user", "content":
-                        "Ти не викликав жодного інструмента, лише описав намір. Виконай "
-                        "крок ДІЄЮ: виклич write_file / edit_file / create_from_source / "
-                        "run_shell / read_file. Не пояснюй — РОБИ."})
+                        "Крок ще не виконано: попередня відповідь не містила ні дії "
+                        "(tool call), ні підсумку. Якщо крок уже зроблено — напиши "
+                        "коротке підтвердження. Якщо ще ні — виклич потрібний "
+                        "інструмент як справжній tool/function call (structured), НЕ "
+                        "як текст і НЕ в XML-тегах у відповіді."})
                     continue
-                final = (msg.get("content") or "").strip(); break
+                final = content; break
             messages.append({"role": "assistant", "content": msg.get("content", ""),
                              "tool_calls": calls})
             for call in calls:
@@ -675,6 +686,8 @@ class State(rx.State):
                 self.tok_prompt += stats.get("prompt", 0)
                 self.tok_out = base_out + stats.get("out", counted)
                 self.tok_eval_ns += stats.get("eval_ns", 0)
+                if stats.get("model"):
+                    self.tok_model = stats["model"]
                 self._recompute_tps()
             body = (self.stream_content or "").strip()
             thinking = self.stream_thinking

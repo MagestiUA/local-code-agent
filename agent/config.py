@@ -1,8 +1,9 @@
 """Константи й профілі агента.
 
-Два профілі ролей (вивід замірів на gemma4:26b-a4b-it-qat):
-  EXECUTOR — механічне виконання: думання ВИМКНЕНО, увесь бюджет на код, швидко.
-  PLANNER  — декомпозиція й аналіз: думання УВІМКНЕНО.
+Два профілі ролей, кожен зі своєю моделлю (за нашим бенчмарком — Qwen3-Coder сильніша
+саме в кодингу, gemma4 краще тримає якість на максимальному контексті):
+  EXECUTOR — механічне виконання (tool-loop, код): думання ВИМКНЕНО, модель Qwen3-Coder.
+  PLANNER  — декомпозиція й аналіз: думання УВІМКНЕНО, модель gemma4.
 
 num_ctx=131072 — sweet spot за бенчмарком q4_0+flash attention (gemma4 113.5→108.5
 t/s, лише -4% проти 65536; за 262144 падіння вже різке — лишаємо як опцію не дефолт).
@@ -11,7 +12,7 @@ t/s, лише -4% проти 65536; за 262144 падіння вже різке
 from __future__ import annotations
 
 HOST  = "http://127.0.0.1:11434"
-MODEL = "gemma4:26b-a4b-it-qat"
+MODEL = "gemma4:26b-a4b-it-qat"   # дефолт OllamaClient; профілі нижче перекривають своїм "model"
 
 REQUEST_TIMEOUT = 600
 
@@ -43,6 +44,8 @@ SHELL_TIMEOUT = 120
 # think=on) лишаємо без DRY. options мерджаться в payload у llm.chat/chat_stream.
 _DRY = {"dry_multiplier": 0.3, "dry_base": 1.75, "dry_allowed_length": 2}
 
-# Профілі ролей: (think, num_ctx, temperature, [options])
-EXECUTOR = {"think": False, "num_ctx": 131072, "temperature": 0.2, "options": _DRY}
-PLANNER  = {"think": True,  "num_ctx": 131072, "temperature": 0.3}
+# Профілі ролей: (think, num_ctx, temperature, model, [options])
+EXECUTOR = {"think": False, "num_ctx": 131072, "temperature": 0.2, "options": _DRY,
+            "model": "qwen3-coder-agent:30b"}
+PLANNER  = {"think": True,  "num_ctx": 131072, "temperature": 0.3,
+            "model": MODEL}

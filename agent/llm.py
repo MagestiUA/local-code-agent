@@ -77,9 +77,12 @@ class OllamaClient:
              profile: dict = config.EXECUTOR, fmt: str | dict | None = None) -> dict:
         """Один виклик /api/chat. Повертає message (dict) з полями
         content / thinking / tool_calls (за наявності).
-        fmt="json" або JSON-schema -> примусово валідний JSON у content."""
+        fmt="json" або JSON-schema -> примусово валідний JSON у content.
+        Модель беремо з profile["model"], якщо є (EXECUTOR/PLANNER можуть мати різні
+        моделі) — інакше дефолт клієнта (self.model)."""
+        model = profile.get("model") or self.model
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": messages,
             "stream": False,
             "think": profile["think"],
@@ -99,7 +102,8 @@ class OllamaClient:
         data = r.json()
         self.last_stats = {"prompt": data.get("prompt_eval_count", 0) or 0,
                            "out": data.get("eval_count", 0) or 0,
-                           "eval_ns": data.get("eval_duration", 0) or 0}
+                           "eval_ns": data.get("eval_duration", 0) or 0,
+                           "model": model}
         return data["message"]
 
     def chat_stream(self, messages: list[dict], tools: list | None = None,
@@ -109,8 +113,9 @@ class OllamaClient:
         проміжні чанки -> дельти content/thinking; фінальний -> done зі stats.
         stop_event: threading.Event — якщо встановлено, стрім переривається після
         поточного чанку (частковий результат зберігається)."""
+        model = profile.get("model") or self.model
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": messages,
             "stream": True,
             "think": profile["think"],
@@ -138,7 +143,7 @@ class OllamaClient:
                     continue
                 ev = _stream_event(obj)
                 if ev["done"]:
-                    self.last_stats = ev["stats"]
+                    self.last_stats = {**ev["stats"], "model": model}
                 yield ev
                 if stop_event and stop_event.is_set():
                     break
