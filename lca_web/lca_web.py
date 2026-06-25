@@ -880,6 +880,22 @@ class State(rx.State):
             async with self:
                 self._append("assistant", f"🔧 {name} · {label}", "step", thinking=shown)
 
+    async def _synthesize_with_retry(self, msgs: list, client,
+                                     profile: dict = config.PLANNER) -> tuple[str, str]:
+        """Стрім фінальної відповіді (think=on). Живий кейс: модель «застрягла» в
+        роздумах (видно довгий thinking-монолог) і так і не дійшла до фінального
+        контенту — body порожній, хоч thinking — ні. Той самий клас бага, що
+        порожні tool_calls у фазі збору (agent_loop.should_nudge), але тут це
+        ОКРЕМА точка (синтез, не збір), тож власний, простіший retry: один
+        повторний прохід з прямим нагадуванням відповісти, перш ніж здаватись."""
+        body, thinking, _ = await self._run_stream(client.chat_stream(msgs, profile=profile))
+        if not (body or "").strip():
+            msgs.append({"role": "user", "content":
+                "Ти не дав фінальної відповіді (лише міркував). Дай КОНКРЕТНУ "
+                "відповідь користувачу зараз, без подальших роздумів."})
+            body, thinking, _ = await self._run_stream(client.chat_stream(msgs, profile=profile))
+        return body, thinking
+
     async def _run_tool_chat(self, msgs: list, tctx: ToolContext, client,
                              max_rounds: int = 6, gather_first: bool = False,
                              gather_profile: dict = config.EXECUTOR) -> str:
@@ -932,8 +948,7 @@ class State(rx.State):
                                                 digest_profile=gather_profile)
             async with self:
                 self.status = "Формулюю відповідь…"
-            body, thinking, _ = await self._run_stream(
-                client.chat_stream(msgs, profile=config.PLANNER))
+            body, thinking = await self._synthesize_with_retry(msgs, client)
             async with self:
                 self._append("assistant", body or "(порожня відповідь)", "answer",
                              thinking=thinking)
@@ -943,6 +958,10 @@ class State(rx.State):
             body, thinking, tool_calls = await self._run_stream(
                 client.chat_stream(msgs, tools=tools, profile=config.PLANNER))
             if not tool_calls:                       # модель завершила — це фінальна відповідь
+                if not (body or "").strip():
+                    # Завершила без жодного тула, але й без контенту — той самий
+                    # "застрягла в роздумах" живий кейс, тут без передісторії тулів.
+                    body, thinking = await self._synthesize_with_retry(msgs, client)
                 async with self:
                     self._append("assistant", body, "answer", thinking=thinking)
                 return body
@@ -954,8 +973,7 @@ class State(rx.State):
         msgs.append({"role": "user",
                      "content": "Достатньо читання. Дай повну відповідь українською за "
                                 "зібраними даними, більше не викликай тулів."})
-        body, thinking, _ = await self._run_stream(
-            client.chat_stream(msgs, profile=config.PLANNER))
+        body, thinking = await self._synthesize_with_retry(msgs, client)
         async with self:
             self._append("assistant", body or "(не вдалося сформувати відповідь)",
                          "answer", thinking=thinking)
