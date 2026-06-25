@@ -17,7 +17,7 @@ from agent import attachments as A
 from agent import config
 from agent import convo
 from agent import session as sess
-from agent.agent_loop import _estimate_iters, NUDGE_TEXT, should_nudge
+from agent.agent_loop import _estimate_iters, NUDGE_TEXT, recover_tool_calls, should_nudge
 from agent.answerer import build_context
 from agent.intent import classify_intent
 from agent.llm import OllamaClient
@@ -598,7 +598,7 @@ class State(rx.State):
                 lambda: client.chat(messages, tools=reg.schema(), profile=config.EXECUTOR))
             if client.last_stats:
                 stats.append(dict(client.last_stats))
-            calls = msg.get("tool_calls") or []
+            calls, recovered = recover_tool_calls(msg)
             if not calls:
                 content = (msg.get("content") or "").strip()
                 # Підштовхуємо РІВНО ОДИН раз, незалежно від того, чи вже були дії
@@ -610,7 +610,7 @@ class State(rx.State):
                     messages.append({"role": "user", "content": NUDGE_TEXT})
                     continue
                 final = content; break
-            messages.append({"role": "assistant", "content": msg.get("content", ""),
+            messages.append({"role": "assistant", "content": "" if recovered else msg.get("content", ""),
                              "tool_calls": calls})
             for call in calls:
                 name = call.get("function", {}).get("name", "")
@@ -728,7 +728,7 @@ class State(rx.State):
             for _ in range(max_rounds):
                 msg = await asyncio.to_thread(
                     lambda: client.chat(msgs, tools=tools, profile=config.EXECUTOR))
-                tool_calls = msg.get("tool_calls") or []
+                tool_calls, recovered = recover_tool_calls(msg)
                 if not tool_calls:
                     content = (msg.get("content") or "").strip()
                     # Якщо контент непорожній і не просочений — це справді "досить
@@ -741,7 +741,7 @@ class State(rx.State):
                         msgs.append({"role": "user", "content": NUDGE_TEXT})
                         continue
                     break
-                msgs.append({"role": "assistant", "content": msg.get("content", ""),
+                msgs.append({"role": "assistant", "content": "" if recovered else msg.get("content", ""),
                              "tool_calls": tool_calls})
                 await self._dispatch_tool_calls(tool_calls, msgs, reg, tctx)
             async with self:

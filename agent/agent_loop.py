@@ -85,6 +85,56 @@ def _looks_like_leaked_tool_call(content: str) -> bool:
     return bool(content) and bool(_LEAKED_CALL_RE.search(content))
 
 
+def _extract_leaked_tool_call(content: str) -> dict | None:
+    """Розпарсити просочений виклик тула з тексту (XML-теги чи голий JSON) у
+    справжній tool_call dict — і ВИКОНАТИ дію одразу, замість ще одного nudge-раунду.
+    Живий кейс: модель повторила ТОЙ САМИЙ просочений формат і після nudge (2/2),
+    включно з малформованим зайвим '}' наприкінці — звичайний retry тут не зарадить,
+    бо модель стабільно ламає формат саме так. Парсинг стійкий до:
+    - обгортки <tool_call>/<tools> (чи без неї — голий JSON);
+    - зайвих символів/дужок ПІСЛЯ валідного JSON-обʼєкта (рахуємо глибину дужок і
+      зупиняємось на першому балансі, ігноруючи хвіст)."""
+    if not content:
+        return None
+    text = re.sub(r'</?tool_call>|</?tools>', '', content, flags=re.IGNORECASE).strip()
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    end = None
+    for i, ch in enumerate(text[start:], start):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        return None
+    try:
+        obj = json.loads(text[start:end])
+    except Exception:
+        return None
+    name = obj.get("name")
+    args = obj.get("arguments", {})
+    if not isinstance(name, str) or not name or not isinstance(args, dict):
+        return None
+    return {"function": {"name": name, "arguments": args}}
+
+
+def recover_tool_calls(msg: dict) -> tuple[list[dict], bool]:
+    """Повертає (tool_calls, recovered). Якщо модель віддала справжні structured
+    tool_calls — повертає їх як є (recovered=False). Якщо ні, але контент містить
+    розпарсюваний просочений виклик — повертає його як один tool_call
+    (recovered=True), щоб виконати ту саму дію без додаткового раунду."""
+    calls = msg.get("tool_calls") or []
+    if calls:
+        return calls, False
+    leaked = _extract_leaked_tool_call((msg.get("content") or "").strip())
+    return ([leaked], True) if leaked else ([], False)
+
+
 # Спільна для УСІХ tool-loop'ів (agent_loop.run_step, lca_web._run_tool_step,
 # lca_web._run_tool_chat) перевірка "чи варто підштовхнути модель ще раз замість
 # того, щоб прийняти цю відповідь як фінальну". Раніше кожен loop мав свою копію
@@ -144,7 +194,7 @@ def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = Non
         msg = client.chat(messages, tools=registry.schema(), profile=config.EXECUTOR)
         if stats_sink is not None and client.last_stats:
             stats_sink.append(dict(client.last_stats))
-        calls = msg.get("tool_calls") or []
+        calls, recovered = recover_tool_calls(msg)
         if not calls:
             content = (msg.get("content") or "").strip()
             # НЕ повертаємо зламаний/порожній текст назад як assistant-повідомлення —
@@ -156,7 +206,9 @@ def run_step(step_text: str, ctx: ToolContext, client: OllamaClient | None = Non
                 continue
             return content, log
 
-        messages.append({"role": "assistant", "content": msg.get("content", ""),
+        # recovered=True: викликали тул з розпарсеного просоченого тексту — НЕ ехо-имо
+        # сам зламаний текст назад (той самий анти-анкоринг, що й для nudge).
+        messages.append({"role": "assistant", "content": "" if recovered else msg.get("content", ""),
                          "tool_calls": calls})
         for call in calls:
             name = call.get("function", {}).get("name", "")

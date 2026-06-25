@@ -62,7 +62,32 @@ def main() -> None:
     assert (root / "after_leak.txt").read_text(encoding="utf-8") == "ok", "nudge не витягнув крок (leak)"
     assert "Готово" in final4
 
-    print("OK: tool-loop виконує тули через реєстр, завершується, ліміт ітерацій тримає, nudge витягує порожні/просочені відповіді")
+    # Просочений виклик з ПОВНИМИ аргументами -> розпарсити й ВИКОНАТИ напряму,
+    # без nudge-раунду взагалі (живий кейс: модель повторює той самий зламаний
+    # формат і ПІСЛЯ nudge — retry не зарадить, бо вже маємо все потрібне з тексту).
+    leaked_full_args = LoopStub([
+        {"content": '{"name": "write_file", "arguments": '
+                    '{"path": "after_recover.txt", "content": "recovered"}}', "tool_calls": []},
+        {"content": "Готово", "tool_calls": []},
+    ])
+    final5, log5 = run_step("створи after_recover.txt", ctx, client=leaked_full_args, max_iters=5)
+    assert (root / "after_recover.txt").read_text(encoding="utf-8") == "recovered", "не розпарсило й не виконало"
+    assert any("write_file" in entry for entry in log5)
+    assert "Готово" in final5
+
+    # Той самий розпарсюваний випадок, але з малформованим зайвим '}' наприкінці
+    # (живий кейс на qwen3-coder) — брейс-каунтинг має зупинитись на балансі й
+    # ігнорувати хвіст.
+    leaked_malformed = LoopStub([
+        {"content": '{"name": "write_file", "arguments": '
+                    '{"path": "after_malformed.txt", "content": "ok2"}}}', "tool_calls": []},
+        {"content": "Готово", "tool_calls": []},
+    ])
+    final6, log6 = run_step("створи after_malformed.txt", ctx, client=leaked_malformed, max_iters=5)
+    assert (root / "after_malformed.txt").read_text(encoding="utf-8") == "ok2", "не впоралось з малформованим хвостом"
+    assert "Готово" in final6
+
+    print("OK: tool-loop виконує тули через реєстр, завершується, ліміт ітерацій тримає, nudge витягує порожні/просочені відповіді, парсинг просочених викликів виконує дію напряму")
     print(f"  журнал кроку 1: {log}")
 
 
